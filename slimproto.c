@@ -382,6 +382,10 @@ static void process_strm(u8_t *pkt, int len) {
 			LOCK_O;
 			output.threshold = strm->output_threshold;
 			output.next_replay_gain = unpackN(&strm->replay_gain);
+#if DSP
+			dsp_set_replaygain(output.next_replay_gain);
+			if (dsp_replaygain_managed()) output.next_replay_gain = 0;
+#endif
 			output.fade_mode = strm->transition_type - '0';
 			output.fade_secs = strm->transition_period;
 			output.invert    = (strm->flags & 0x03) == 0x03;
@@ -444,6 +448,9 @@ static void process_audg(u8_t *pkt, int len) {
 
 	LOG_DEBUG("audg gainL: %u gainR: %u adjust: %u", audg->gainL, audg->gainR, audg->adjust);
 
+	#if DSP
+	dsp_set_volume(audg->adjust ? audg->gainL : FIXED_ONE, audg->adjust ? audg->gainR : FIXED_ONE);
+	#endif
 	set_volume(audg->adjust ? audg->gainL : FIXED_ONE, audg->adjust ? audg->gainR : FIXED_ONE);
 }
 

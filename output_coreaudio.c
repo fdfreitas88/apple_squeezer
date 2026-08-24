@@ -29,6 +29,7 @@ static bool ca_listeners_installed;
 static volatile bool ca_device_changed;
 static volatile unsigned ca_underruns;
 static volatile unsigned ca_overloads;
+static volatile bool ca_underrun_armed;
 static unsigned ca_reopens;
 static u32_t ca_last_underrun_log;
 static unsigned ca_pipeline_frames;
@@ -40,11 +41,15 @@ static u32_t ca_headroom_gain = FIXED_ONE;
 static u32_t ca_dither_state = 0x41535043U;
 static uint64_t ca_processed_frames;
 static uint64_t ca_clipped_samples;
+static bool ca_physical_verified;
+static bool ca_volume_verified;
+static bool ca_exclusive_verified;
 static u32_t ca_last_telemetry_log;
 static thread_type ca_monitor_thread;
 static volatile bool ca_monitor_running;
 
 extern struct outputstate output;
+extern struct decodestate decode;
 extern struct buffer *outputbuf;
 extern u8_t *silencebuf;
 #if DSD
@@ -53,6 +58,12 @@ extern u8_t *silencebuf_dsd;
 
 #define LOCK mutex_lock(outputbuf->mutex)
 #define UNLOCK mutex_unlock(outputbuf->mutex)
+
+/* LMS deliberately empties the output buffer on stop and track replacement.
+ * That controlled boundary is silence, not callback starvation. */
+void coreaudio_note_output_flush(void) {
+	ca_underrun_armed = false;
+}
 
 static const char *ca_transport(void) {
 #if DSD
@@ -211,19 +222,43 @@ static bool ca_physical_format(AudioDeviceID device, unsigned requested, bool st
 				kAudioObjectPropertyScopeGlobal, &f, &fsize)) {
 			bool pcm = f.mFormatID == kAudioFormatLinearPCM;
 			bool rate = f.mSampleRate + 0.5 >= requested && f.mSampleRate - 0.5 <= requested;
-			bool stereo = f.mChannelsPerFrame >= 2;
+			bool stereo = f.mChannelsPerFrame == 2;
 			bool integer = !!(f.mFormatFlags & kAudioFormatFlagIsSignedInteger);
+			bool noninterleaved = !!(f.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+			bool bytes_valid = f.mBytesPerFrame != 0 && f.mFramesPerPacket != 0;
 			LOG_INFO("CoreAudio physical stream %u: %.0f Hz, %u ch, %u-bit, format=%c%c%c%c flags=0x%x",
 				(unsigned)streams[i], f.mSampleRate, f.mChannelsPerFrame, f.mBitsPerChannel,
 				(char)(f.mFormatID >> 24), (char)(f.mFormatID >> 16), (char)(f.mFormatID >> 8),
 				(char)f.mFormatID, (unsigned)f.mFormatFlags);
-			if (pcm && rate && stereo && (!strict || (integer && f.mBitsPerChannel >= 24))) valid = true;
+			LOG_INFO("CoreAudio physical layout: bytes/frame=%u frames/packet=%u bytes/packet=%u interleaved=%s",
+				f.mBytesPerFrame, f.mFramesPerPacket, f.mBytesPerPacket, noninterleaved ? "no" : "yes");
+			if (pcm && rate && stereo && bytes_valid && (!strict || (integer && f.mBitsPerChannel >= 24))) valid = true;
 		}
 	}
 	free(streams);
 	if (!valid) LOG_ERROR("CoreAudio physical stream does not satisfy %u Hz stereo PCM%s",
 		requested, strict ? " integer bit-perfect requirements" : "");
 	return valid;
+}
+
+static bool ca_verify_hardware_controls(AudioDeviceID device, bool enforce_unity) {
+	AudioObjectPropertyAddress volume = { kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+		kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain };
+	AudioObjectPropertyAddress mute = { kAudioDevicePropertyMute,
+		kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain };
+	UInt32 size; Float32 scalar = 1.0f; UInt32 muted = 0; Boolean settable = false; bool has_volume, has_mute, ok = true;
+	has_volume = AudioObjectHasProperty(device, &volume);
+	has_mute = AudioObjectHasProperty(device, &mute);
+	if (enforce_unity && has_volume && AudioObjectIsPropertySettable(device, &volume, &settable) == noErr && settable)
+		(void)AudioObjectSetPropertyData(device, &volume, 0, NULL, sizeof(scalar), &scalar);
+	settable = false;
+	if (enforce_unity && has_mute && AudioObjectIsPropertySettable(device, &mute, &settable) == noErr && settable)
+		(void)AudioObjectSetPropertyData(device, &mute, 0, NULL, sizeof(muted), &muted);
+	if (has_volume) { size=sizeof(scalar); ok=AudioObjectGetPropertyData(device,&volume,0,NULL,&size,&scalar)==noErr&&scalar>.9999f; }
+	if (has_mute) { size=sizeof(muted); ok=ok&&AudioObjectGetPropertyData(device,&mute,0,NULL,&size,&muted)==noErr&&!muted; }
+	LOG_INFO("CoreAudio hardware controls: volume=%s mute=%s unity=%s",
+		has_volume?"present":"fixed",has_mute?"present":"absent",ok?"verified":"unverified");
+	return ok;
 }
 
 static void ca_measure_latency(void) {
@@ -472,6 +507,13 @@ static OSStatus ca_render(void *context, AudioUnitRenderActionFlags *flags,
 		output.gainL = output.gainR = FIXED_ONE;
 	}
 	output.device_frames = ca_pipeline_frames;
+#if DSP
+	/* Include FIR and fractional-delay latency in LMS play-point accounting. */
+	output.device_frames += dsp_latency_frames();
+#endif
+#if RESAMPLE
+	output.device_frames += resample_latency_frames();
+#endif
 	host_now = mach_absolute_time();
 	if ((timestamp->mFlags & kAudioTimeStampHostTimeValid) && timestamp->mHostTime > host_now) {
 		mach_timebase_info_data_t info;
@@ -482,15 +524,23 @@ static OSStatus ca_render(void *context, AudioUnitRenderActionFlags *flags,
 	}
 	output.updated = gettime_ms();
 	if (output.updated - ca_last_telemetry_log >= 10000) {
-		LOG_INFO("CoreAudio telemetry: mode=%s transport=%s rate=%u buffer=%u latency=%u underruns=%u overloads=%u reopens=%u processed=%llu clipped=%llu",
+		LOG_INFO("CoreAudio telemetry: mode=%s transport=%s rate=%u buffer=%u latency=%u underruns=%u overloads=%u reopens=%u processed=%llu clipped=%llu physical=%s volume=%s exclusive=%s",
 			ca_mode, ca_transport(), output.current_sample_rate, ca_buffer_frames, ca_pipeline_frames, ca_underruns,
 			ca_overloads, ca_reopens,
-			(unsigned long long)ca_processed_frames, (unsigned long long)ca_clipped_samples);
+			(unsigned long long)ca_processed_frames, (unsigned long long)ca_clipped_samples,
+			ca_physical_verified?"verified":"unverified", ca_volume_verified?"verified":"unverified",
+			ca_exclusive_verified?"verified":"not-requested");
 		ca_last_telemetry_log = output.updated;
 	}
 	output.frames_played_dmp = output.frames_played;
-	if (output.state == OUTPUT_RUNNING && _buf_used(outputbuf) < BYTES_PER_FRAME) {
+	/* Count a starvation episode only after this stream has delivered audio.
+	 * Explicit flushes and device reopens disarm detection, and a continuous
+	 * empty interval counts once rather than once per CoreAudio callback. */
+	frames_t buffered_frames = _buf_used(outputbuf) / BYTES_PER_FRAME;
+	if (output.state == OUTPUT_RUNNING && decode.state == DECODE_RUNNING &&
+			buffered_frames == 0 && ca_underrun_armed) {
 		++ca_underruns;
+		ca_underrun_armed = false;
 		if (output.updated - ca_last_underrun_log >= 5000) {
 			LOG_WARN("CoreAudio underrun: total=%u profile=%s buffer=%u frames",
 				ca_underruns, ca_profile, ca_buffer_frames);
@@ -499,6 +549,7 @@ static OSStatus ca_render(void *context, AudioUnitRenderActionFlags *flags,
 	}
 	do {
 		frames = _output_frames(remaining);
+		if (frames && buffered_frames && output.state == OUTPUT_RUNNING) ca_underrun_armed = true;
 		remaining -= frames;
 	} while (remaining && frames);
 	if (remaining) memset(write_ptr, 0, remaining * BYTES_PER_FRAME);
@@ -511,6 +562,7 @@ static OSStatus ca_render(void *context, AudioUnitRenderActionFlags *flags,
 }
 
 static void ca_dispose(void) {
+	ca_underrun_armed = false;
 	ca_remove_listeners();
 	if (audio_unit) {
 		AudioOutputUnitStop(audio_unit);
@@ -531,6 +583,7 @@ void _coreaudio_open(void) {
 	AudioComponent component;
 	OSStatus status;
 	ca_dispose();
+	ca_physical_verified = ca_volume_verified = ca_exclusive_verified = false;
 	if (output.state == OUTPUT_OFF) return;
 	++ca_reopens;
 	audio_device = ca_find_device(output.device);
@@ -540,6 +593,7 @@ void _coreaudio_open(void) {
 		LOG_ERROR("unable to acquire exclusive access to CoreAudio device %u", (unsigned)audio_device);
 		goto failed;
 	}
+	ca_exclusive_verified = ca_exclusive && ca_hogged;
 	if (!ca_set_nominal_rate(audio_device, output.current_sample_rate, &device_rate)) goto failed;
 	ca_configure_buffer(audio_device);
 	if (AudioComponentInstanceNew(component, &audio_unit) != noErr) goto failed;
@@ -571,7 +625,10 @@ void _coreaudio_open(void) {
 	}
 	if (AudioUnitSetProperty(audio_unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &callback, sizeof(callback)) != noErr) goto failed;
 	if ((status = AudioUnitInitialize(audio_unit)) != noErr || (status = AudioOutputUnitStart(audio_unit)) != noErr) goto failed;
-	if (!ca_physical_format(audio_device, output.current_sample_rate, ca_bitperfect)) goto failed;
+	ca_physical_verified = ca_physical_format(audio_device, output.current_sample_rate, ca_bitperfect);
+	if (!ca_physical_verified) goto failed;
+	ca_volume_verified = ca_verify_hardware_controls(audio_device, ca_bitperfect);
+	if (ca_bitperfect && !ca_volume_verified) { LOG_ERROR("bit-perfect mode cannot verify unity hardware volume"); goto failed; }
 	ca_measure_latency();
 	ca_add_listeners();
 	output.error_opening = false;

@@ -51,8 +51,13 @@ frames_t _output_frames(frames_t avail) {
 	
 	s32_t cross_gain_in = 0, cross_gain_out = 0; s32_t *cross_ptr = NULL;
 	
-	s32_t gainL = output.current_replay_gain ? gain(output.gainL, output.current_replay_gain) : output.gainL;
-	s32_t gainR = output.current_replay_gain ? gain(output.gainR, output.current_replay_gain) : output.gainR;
+#if DSP
+	u32_t replay_gain = dsp_replaygain_managed() ? 0 : output.current_replay_gain;
+#else
+	u32_t replay_gain = output.current_replay_gain;
+#endif
+	s32_t gainL = replay_gain ? gain(output.gainL, replay_gain) : output.gainL;
+	s32_t gainR = replay_gain ? gain(output.gainR, replay_gain) : output.gainR;
 
 	if (output.invert) { gainL = -gainL; gainR = -gainR; }
 
@@ -437,6 +442,9 @@ void output_close_common(void) {
 
 void output_flush(void) {
 	LOG_INFO("flush output buffer (full)");
+#if COREAUDIO
+	coreaudio_note_output_flush();
+#endif
 	buf_flush(outputbuf);
 	LOCK;
 	output.fade = FADE_INACTIVE;

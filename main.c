@@ -128,7 +128,7 @@ static void usage(const char *argv0) {
 			"  -S <Power Script>\tAbsolute path to script to launch on power commands from LMS\n"
 #endif
 #if RESAMPLE
-		   "  -R -u [params]\tResample, params = <recipe>:<flags>:<attenuation>:<precision>:<passband_end>:<stopband_start>:<phase_response>,\n" 
+		   "  -R -u [params]\tResample, params = <recipe>:<flags>:<attenuation>:<precision>:<passband_end>:<stopband_start>:<phase_response>:<target_rate>,\n"
 		   "  \t\t\t recipe = (v|h|m|l|q)(L|I|M)(s) [E|X], E = exception - resample only if native rate not supported, X = async - resample to max rate for device, otherwise to max sync rate\n"
 		   "  \t\t\t flags = num in hex,\n"
 		   "  \t\t\t attenuation = attenuation in dB to apply (default is -1db if not explicitly set),\n"
@@ -136,6 +136,10 @@ static void usage(const char *argv0) {
 		   "  \t\t\t passband_end = number in percent (0dB pt. bandwidth to preserve. nyquist = 100%%),\n"
 		   "  \t\t\t stopband_start = number in percent (Aliasing/imaging control. > passband_end),\n"
 		   "  \t\t\t phase_response = 0-100 (0 = minimum / 50 = linear / 100 = maximum)\n"
+		   "  \t\t\t target_rate = optional exact output rate; unsupported targets fall back to automatic selection\n"
+#endif
+#if DSP
+		   "  -Q <params|@json>\tNative PCM DSP; preamp=<dB>;headroom=auto|<dB>;bypass=true|false;eq=<12 gains>;peak/notch/shelves/pass filters, or @versioned-player-config.json\n"
 #endif
 #if DSD
 #if ALSA
@@ -212,6 +216,9 @@ static void usage(const char *argv0) {
 #if RESAMPLE
 		   " RESAMPLE"
 #endif
+#endif
+#if DSP
+		   " DSP"
 #endif
 #if ALAC
 		   " ALAC"
@@ -330,6 +337,7 @@ int main(int argc, char **argv) {
 	unsigned rates[MAX_SUPPORTED_SAMPLERATES] = { 0 };
 	unsigned rate_delay = 0;
 	char *resample = NULL;
+	char *dsp = NULL;
 	char *output_params = NULL;
 	unsigned idle = 0;
 #if LINUX || FREEBSD || SUN
@@ -383,6 +391,9 @@ int main(int argc, char **argv) {
 	while (optind < argc && strlen(argv[optind]) >= 2 && argv[optind][0] == '-') {
 		char *opt = argv[optind] + 1;
 		if (strstr("oabcCdefmMnNpPrsZ"
+#if DSP
+				   "Q"
+#endif
 #if ALSA
 				   "UVO"
 #endif
@@ -539,6 +550,11 @@ int main(int argc, char **argv) {
 				}
 			}
 			break;
+#if DSP
+		case 'Q':
+			dsp = optarg;
+			break;
+#endif
 		case 's':
 			server = optarg;
 			break;
@@ -857,9 +873,9 @@ int main(int argc, char **argv) {
 
 	decode_init(log_decode, include_codecs, exclude_codecs);
 
-#if RESAMPLE
-	if (resample) {
-		process_init(resample);
+#if PROCESS
+	if (resample || dsp) {
+		process_init(resample, dsp);
 	}
 #endif
 

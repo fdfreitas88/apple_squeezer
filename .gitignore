@@ -1,5 +1,7 @@
 .vscode/
 apple-squeezer-intel
+apple-squeezer-dspctl
+test-results/
 *.o
 squeezelite
 squeezelite-pulse

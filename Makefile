@@ -10,6 +10,7 @@ OPT_FF         = -DFFMPEG
 OPT_ALAC       = -DALAC
 OPT_LINKALL    = -DLINKALL
 OPT_RESAMPLE   = -DRESAMPLE
+OPT_DSP        = -DDSP
 OPT_VIS        = -DVISEXPORT
 OPT_IR         = -DIR
 OPT_GPIO       = -DGPIO
@@ -35,6 +36,7 @@ SOURCES_DSD      = dsd.c dop.c dsd2pcm/dsd2pcm.c
 SOURCES_FF       = ffmpeg.c
 SOURCES_ALAC     ?= alac.c alac_wrapper.cpp
 SOURCES_RESAMPLE = process.c resample.c
+SOURCES_DSP      = dsp.c dsp_config.c dsp_ir.c
 SOURCES_VIS      = output_vis.c
 SOURCES_IR       = ir.c
 SOURCES_GPIO     = gpio.c
@@ -84,6 +86,12 @@ ifneq (,$(findstring $(OPT_OPUS), $(OPTS)))
 endif
 ifneq (,$(findstring $(OPT_RESAMPLE), $(OPTS)))
 	SOURCES += $(SOURCES_RESAMPLE)
+endif
+ifneq (,$(findstring $(OPT_DSP), $(OPTS)))
+	SOURCES += $(SOURCES_DSP)
+ifeq (,$(findstring process.c, $(SOURCES)))
+	SOURCES += process.c
+endif
 endif
 ifneq (,$(findstring $(OPT_VIS), $(OPTS)))
 	SOURCES += $(SOURCES_VIS)

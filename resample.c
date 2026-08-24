@@ -42,6 +42,8 @@ struct soxr {
 	double scale;
 	bool max_rate;
 	bool exception;
+	unsigned target_rate;
+	unsigned latency_frames;
 #if !LINKALL
 	// soxr symbols to be dynamically loaded
 	soxr_io_spec_t (* soxr_io_spec)(soxr_datatype_t itype, soxr_datatype_t otype);
@@ -51,6 +53,7 @@ struct soxr {
 	void (* soxr_delete)(soxr_t);
 	soxr_error_t (* soxr_process)(soxr_t, soxr_in_t, size_t, size_t *, soxr_out_t, size_t olen, size_t *);
 	size_t *(* soxr_num_clips)(soxr_t);
+	double (* soxr_delay)(soxr_t);
 #if RESAMPLE_MP
 	soxr_runtime_spec_t (* soxr_runtime_spec)(unsigned num_threads);
 #endif
@@ -87,6 +90,7 @@ void resample_samples(struct processstate *process) {
 	process->out_frames = odone;
 	process->total_in  += idone;
 	process->total_out += odone;
+	r->latency_frames = (unsigned)ceil(SOXR(r, delay, r->resampler));
 	
 	clip_cnt = *(SOXR(r, num_clips, r->resampler));
 	if (clip_cnt - r->old_clips) {
@@ -133,7 +137,20 @@ bool resample_newstream(struct processstate *process, unsigned raw_sample_rate, 
 	unsigned outrate = 0;
 	int i;
 
-	if (r->exception) {
+	if (r->target_rate) {
+		for (i = 0; supported_rates[i]; i++) {
+			if (supported_rates[i] == r->target_rate) {
+				outrate = r->target_rate;
+				break;
+			}
+		}
+		if (!outrate) {
+			LOG_WARN("requested resample target %u Hz is not supported by the output device; using automatic selection",
+				r->target_rate);
+		}
+	}
+
+	if (!outrate && r->exception) {
 		// find direct match - avoid resampling
 		for (i = 0; supported_rates[i]; i++) {
 			if (raw_sample_rate == supported_rates[i]) {
@@ -225,11 +242,14 @@ bool resample_newstream(struct processstate *process, unsigned raw_sample_rate, 
 		}
 
 		r->old_clips = 0;
+		r->latency_frames = (unsigned)ceil(SOXR(r, delay, r->resampler));
+		LOG_INFO("resampler latency: %u output frames", r->latency_frames);
 		return true;
 
 	} else {
 
 		LOG_INFO("disable resampling - rates match");
+		r->latency_frames = 0;
 		return false;
 	}
 }
@@ -239,6 +259,7 @@ void resample_flush(void) {
 		SOXR(r, delete, r->resampler);
 		r->resampler = NULL;
 	}
+	if (r) r->latency_frames = 0;
 }
 
 static bool load_soxr(void) {
@@ -257,6 +278,7 @@ static bool load_soxr(void) {
 	r->soxr_delete = dlsym(handle, "soxr_delete");
 	r->soxr_process = dlsym(handle, "soxr_process");
 	r->soxr_num_clips = dlsym(handle, "soxr_num_clips");
+	r->soxr_delay = dlsym(handle, "soxr_delay");
 #if RESAMPLE_MP
 	r->soxr_runtime_spec = dlsym(handle, "soxr_runtime_spec");
 #endif
@@ -276,6 +298,8 @@ bool resample_init(char *opt) {
 	char *recipe = NULL, *flags = NULL;
 	char *atten = NULL;
 	char *precision = NULL, *passband_end = NULL, *stopband_begin = NULL, *phase_response = NULL;
+	char *target_rate = NULL;
+	char *named_preset = NULL;
 
 	r = malloc(sizeof(struct soxr));
 	if (!r) {
@@ -285,8 +309,10 @@ bool resample_init(char *opt) {
 
 	r->resampler = NULL;
 	r->old_clips = 0;
+	r->latency_frames = 0;
 	r->max_rate = false;
 	r->exception = false;
+	r->target_rate = 0;
 
 	if (!load_soxr()) {
 		LOG_WARN("resampling disabled");
@@ -301,6 +327,7 @@ bool resample_init(char *opt) {
 		passband_end = next_param(NULL, ':');
 		stopband_begin = next_param(NULL, ':');
 		phase_response = next_param(NULL, ':');
+		target_rate = next_param(NULL, ':');
 	}
 
 	// default to HQ (20 bit) if not user specified
@@ -315,6 +342,7 @@ bool resample_init(char *opt) {
 	r->q_phase_response = -1;
 
 	if (recipe && recipe[0] != '\0') {
+		if (!strncmp(recipe, "preset=", 7)) named_preset = recipe + 7;
 		if (strchr(recipe, 'v')) r->q_recipe = SOXR_VHQ;
 		if (strchr(recipe, 'h')) r->q_recipe = SOXR_HQ;
 		if (strchr(recipe, 'm')) r->q_recipe = SOXR_MQ;
@@ -328,6 +356,17 @@ bool resample_init(char *opt) {
 		if (strchr(recipe, 'X')) r->max_rate = true;
 		// E = exception, only resample if native rate is not supported
 		if (strchr(recipe, 'E')) r->exception = true;
+	}
+	if (named_preset) {
+		r->q_recipe = SOXR_VHQ;
+		r->q_precision = 28;
+		if (!strcmp(named_preset, "linear")) { r->q_recipe |= SOXR_LINEAR_PHASE; r->q_passband_end=.95; r->q_stopband_begin=1; r->q_phase_response=50; }
+		else if (!strcmp(named_preset, "minimum")) { r->q_recipe |= SOXR_MINIMUM_PHASE; r->q_passband_end=.95; r->q_stopband_begin=1; r->q_phase_response=0; }
+		else if (!strcmp(named_preset, "intermediate")) { r->q_recipe |= SOXR_INTERMEDIATE_PHASE; r->q_passband_end=.95; r->q_stopband_begin=1; r->q_phase_response=25; }
+		else if (!strcmp(named_preset, "gentle")) { r->q_recipe |= SOXR_LINEAR_PHASE; r->q_passband_end=.90; r->q_stopband_begin=.98; r->q_phase_response=50; }
+		else if (!strcmp(named_preset, "steep")) { r->q_recipe |= SOXR_LINEAR_PHASE|SOXR_STEEP_FILTER; r->q_passband_end=.97; r->q_stopband_begin=.995; r->q_phase_response=50; }
+		else if (!strcmp(named_preset, "apodizing")) { r->q_recipe |= SOXR_INTERMEDIATE_PHASE; r->q_passband_end=.88; r->q_stopband_begin=.96; r->q_phase_response=20; }
+		else { LOG_WARN("unknown resampling preset '%s'", named_preset); free(r); r=NULL; return false; }
 	}
 
 	if (flags) {
@@ -357,11 +396,27 @@ bool resample_init(char *opt) {
 		r->q_phase_response = atof(phase_response);
 	}
 
+	if (target_rate) {
+		unsigned requested = (unsigned)strtoul(target_rate, NULL, 10);
+		unsigned allowed[] TEST_RATES;
+		int i;
+		for (i = 0; allowed[i]; ++i) {
+			if (allowed[i] == requested) {
+				r->target_rate = requested;
+				break;
+			}
+		}
+		if (!r->target_rate) LOG_WARN("invalid resample target '%s'; using automatic selection", target_rate);
+	}
+
 	LOG_INFO("resampling %s recipe: 0x%02x, flags: 0x%02x, scale: %03.2f, precision: %03.1f, passband_end: %03.5f, stopband_begin: %03.5f, phase_response: %03.1f",
 			r->max_rate ? "async" : "sync",
 			r->q_recipe, r->q_flags, r->scale, r->q_precision, r->q_passband_end, r->q_stopband_begin, r->q_phase_response);
+	if (r->target_rate) LOG_INFO("manual PCM resample target: %u Hz", r->target_rate);
 
 	return true;
 }
+
+unsigned resample_latency_frames(void) { return r ? r->latency_frames : 0; }
 
 #endif // #if RESAMPLE

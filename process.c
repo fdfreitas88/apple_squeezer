@@ -31,21 +31,61 @@ extern struct buffer *outputbuf;
 extern struct decodestate decode;
 struct processstate process;
 extern struct codec *codec;
+#if DSD
+extern struct outputstate output;
+#endif
 
 #define LOCK_D   mutex_lock(decode.mutex);
 #define UNLOCK_D mutex_unlock(decode.mutex);
 #define LOCK_O   mutex_lock(outputbuf->mutex)
 #define UNLOCK_O mutex_unlock(outputbuf->mutex)
 
-// macros to map to processing functions - currently only resample.c
-// this can be made more generic when multiple processing mechanisms get added
 #if RESAMPLE
-#define SAMPLES_FUNC resample_samples
-#define DRAIN_FUNC   resample_drain
-#define NEWSTREAM_FUNC resample_newstream
-#define FLUSH_FUNC   resample_flush
-#define INIT_FUNC    resample_init
+static bool resample_enabled;
+static bool resample_active;
 #endif
+#if DSP
+static bool native_dsp_enabled;
+static bool native_dsp_active;
+static u64_t native_dsp_last_report;
+
+static void _report_native_dsp(void) {
+	struct dsp_telemetry telemetry;
+	dsp_get_telemetry(&telemetry);
+	LOG_INFO("native DSP track: frames=%llu peak=%.2fdBFS true_peak=%.2fdBTP true_peak_overs=%llu clipped=%llu gain=%.2fdB replaygain=%.2fdB loudness=%.2fdB response_peak=%.2fdB limiter_reduction=%.2fdB limiter_events=%llu swaps=%llu latency=%u fir_taps=%u fir_partitions=%u fir_checksum=%016llx limiter=%s",
+		(unsigned long long)telemetry.frames, telemetry.peak_dbfs, telemetry.true_peak_dbfs,
+		(unsigned long long)telemetry.true_peak_overs,
+		(unsigned long long)telemetry.clipped_samples, telemetry.applied_gain_db,
+		telemetry.replaygain_db, telemetry.loudness_compensation_db, telemetry.response_peak_db,
+		telemetry.limiter_gain_reduction_db, (unsigned long long)telemetry.limiter_events,
+		(unsigned long long)telemetry.config_swaps, telemetry.latency_frames,
+		telemetry.fir_taps, telemetry.fir_partitions, (unsigned long long)telemetry.fir_checksum,
+		telemetry.limiter_active ? "on" : "off");
+}
+#endif
+
+static void _run_samples(void) {
+#if RESAMPLE
+	if (resample_active) {
+		resample_samples(&process);
+	} else
+#endif
+	{
+		process.out_frames = process.in_frames;
+		memcpy(process.outbuf, process.inbuf, process.in_frames * BYTES_PER_FRAME);
+		process.total_in += process.in_frames;
+		process.total_out += process.out_frames;
+	}
+#if DSP
+	if (native_dsp_active && process.out_frames) {
+		dsp_process((s32_t *)process.outbuf, process.out_frames);
+		if (process.out_sample_rate && process.total_out - native_dsp_last_report >= process.out_sample_rate) {
+			native_dsp_last_report = process.total_out;
+			_report_native_dsp();
+		}
+	}
+#endif
+}
 
 
 // transfer all processed frames to the output buf
@@ -94,7 +134,7 @@ static void _write_samples(void) {
 // process samples - called with decode mutex set
 void process_samples(void) {
 
-	SAMPLES_FUNC(&process);
+	_run_samples();
 
 	_write_samples();
 
@@ -107,19 +147,55 @@ void process_drain(void) {
 
 	do {
 
-		done = DRAIN_FUNC(&process);
+#if RESAMPLE
+		if (resample_active) {
+			done = resample_drain(&process);
+#if DSP
+			if (native_dsp_active && process.out_frames) dsp_process((s32_t *)process.outbuf, process.out_frames);
+#endif
+		} else
+#endif
+		{
+			process.out_frames = 0;
+			done = true;
+		}
 
 		_write_samples();
 
 	} while (!done);
 
 	LOG_DEBUG("processing track complete - frames in: %lu out: %lu", process.total_in, process.total_out);
+#if DSP
+	if (native_dsp_active) {
+		_report_native_dsp();
+	}
+#endif
 }	
 
 // new stream - called with decode mutex set
 unsigned process_newstream(bool *direct, unsigned raw_sample_rate, unsigned supported_rates[]) {
 
-	bool active = NEWSTREAM_FUNC(&process, raw_sample_rate, supported_rates);
+	bool active = false;
+	bool pcm_stream = true;
+#if DSD
+	pcm_stream = output.next_fmt == PCM;
+	if (!pcm_stream) LOG_INFO("DSD/DoP stream bypasses PCM resampling and native DSP");
+#endif
+
+#if RESAMPLE
+	resample_active = pcm_stream && resample_enabled && resample_newstream(&process, raw_sample_rate, supported_rates);
+	active = resample_active;
+	if (!resample_active) process.in_sample_rate = process.out_sample_rate = raw_sample_rate;
+#else
+	process.in_sample_rate = process.out_sample_rate = raw_sample_rate;
+#endif
+#if DSP
+	if (native_dsp_enabled && pcm_stream) {
+		unsigned dsp_rate = resample_active ? process.out_sample_rate : raw_sample_rate;
+		native_dsp_active = dsp_newstream(dsp_rate);
+		active = active || native_dsp_active;
+	}
+#endif
 
 	LOG_INFO("processing: %s", active ? "active" : "inactive");
 
@@ -131,6 +207,9 @@ unsigned process_newstream(bool *direct, unsigned raw_sample_rate, unsigned supp
 
 		process.in_frames = process.out_frames = 0;
 		process.total_in = process.total_out = 0;
+#if DSP
+		native_dsp_last_report = 0;
+#endif
 
 		max_in_frames = codec->min_space / BYTES_PER_FRAME ;
 
@@ -172,15 +251,31 @@ void process_flush(void) {
 
 	LOG_INFO("process flush");
 
-	FLUSH_FUNC();
+#if RESAMPLE
+	if (resample_enabled) resample_flush();
+	resample_active = false;
+#endif
+#if DSP
+	if (native_dsp_active) dsp_flush();
+	native_dsp_active = false;
+#endif
 
 	process.in_frames = 0;
 }
 
 // init - called with no mutex
-void process_init(char *opt) {
+void process_init(char *resample_opt, char *dsp_opt) {
 
-	bool enabled = INIT_FUNC(opt);
+	bool enabled = false;
+
+#if RESAMPLE
+	resample_enabled = resample_opt && resample_init(resample_opt);
+	enabled = resample_enabled;
+#endif
+#if DSP
+	native_dsp_enabled = dsp_opt && dsp_init(dsp_opt);
+	enabled = enabled || native_dsp_enabled;
+#endif
 
 	memset(&process, 0, sizeof(process));
 

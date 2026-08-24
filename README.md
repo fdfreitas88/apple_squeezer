@@ -1,8 +1,11 @@
-# Apple Squeezer
+# Apple Squeezer Intel v1.0-rc2
 
 Apple Squeezer is an Intel macOS build of Squeezelite using Apple's native
 CoreAudio AUHAL output path. The release candidate targets x86_64 Macs running
 macOS 11 or newer and is based on upstream Squeezelite revision 1595.
+
+This is a pre-release test candidate. It is not signed or notarized, and its
+full 176.4/192 kHz and DSD64/DoP physical qualification remains pending.
 
 The candidate provides native hardware-rate switching, physical stream-format
 verification, CoreAudio latency compensation and device recovery, exclusive
@@ -12,6 +15,8 @@ Chord Mojo transition reporting, and bounded soak-test tools.
 
 See [the Intel CoreAudio candidate guide](doc/coreaudio-intel-candidate.md) for
 build, installation, playback modes, validation, and rollback instructions.
+See [the third-party notices](THIRD_PARTY_NOTICES.md) for source attribution
+and the licenses of bundled components.
 
 ## Upstream and license
 

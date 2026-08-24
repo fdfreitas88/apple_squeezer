@@ -9,8 +9,8 @@ OGG_LIBRARY = $(OGG_INSTALL)/lib/libogg.a
 SOXR_BUILD = third_party/soxr/build-intel
 SOXR_LIBRARY = $(SOXR_BUILD)/src/libsoxr.a
 
-OPTS = -DCOREAUDIO -DDSD -DALAC -DRESAMPLE -DLINKALL -DNO_FAAD -DNO_MAD -DNO_MPG123 -DNO_VORBIS \
-	-DMODEL_NAME=AppleSqueezerIntel -DCUSTOM_VERSION=-coreaudio-intel-rc1
+OPTS = -DCOREAUDIO -DDSD -DALAC -DRESAMPLE -DDSP -DLINKALL -DNO_FAAD -DNO_MAD -DNO_MPG123 -DNO_VORBIS \
+	-DMODEL_NAME=AppleSqueezerIntel -DCUSTOM_VERSION=-apple-squeezer-intel-v1.0-rc2
 
 CFLAGS = -arch x86_64 -mmacosx-version-min=11.0 -Wall -Wextra -fPIC -O2 \
 	-Ithird_party/flac/include -Ithird_party/alac/codec -Ithird_party/soxr/src
@@ -27,10 +27,14 @@ SOURCES_ALAC = alac.c alac_wrapper.cpp \
 	third_party/alac/codec/dp_dec.c \
 	third_party/alac/codec/matrix_dec.c
 EXECUTABLE = apple-squeezer-intel
+DSPCTL = apple-squeezer-dspctl
 
 include Makefile
 
-$(EXECUTABLE): $(FLAC_LIBRARY) $(OGG_LIBRARY) $(SOXR_LIBRARY)
+$(EXECUTABLE): $(FLAC_LIBRARY) $(OGG_LIBRARY) $(SOXR_LIBRARY) $(DSPCTL)
+
+$(DSPCTL): tools/dspctl.c dsp.c dsp_config.c dsp_ir.c squeezelite.h
+	$(CC) -std=gnu99 $(CFLAGS) -DDSP -I. tools/dspctl.c dsp.c dsp_config.c dsp_ir.c -lm -lpthread -o $@
 
 $(SOXR_LIBRARY):
 	cmake -S third_party/soxr -B $(SOXR_BUILD) \
@@ -56,3 +60,8 @@ $(FLAC_LIBRARY): $(OGG_LIBRARY)
 		-DBUILD_TESTING=OFF -DBUILD_DOCS=OFF -DINSTALL_MANPAGES=OFF \
 		-DWITH_OGG=ON -DENABLE_MULTITHREADING=OFF -DBUILD_SHARED_LIBS=OFF
 	cmake --build $(FLAC_BUILD) --target FLAC -j4
+
+.PHONY: test-dsp
+test-dsp:
+	$(CC) -std=gnu99 -Wall -Wextra -O2 -DDSP -I. tools/test-dsp.c dsp.c dsp_config.c dsp_ir.c -lm -lpthread -o /tmp/apple-squeezer-test-dsp
+	/tmp/apple-squeezer-test-dsp

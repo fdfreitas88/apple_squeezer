@@ -1,4 +1,8 @@
-# Apple Squeezer Intel CoreAudio candidate
+# Apple Squeezer Intel v1.0-rc2
+
+The product release name is **Apple Squeezer Intel v1.0-rc2**. LMS firmware
+reporting retains the underlying Squeezelite protocol/source revision and adds
+the product version suffix: `2.0-1595-apple-squeezer-intel-v1.0-rc2`.
 
 This candidate tracks upstream Squeezelite revision 1595 and replaces the
 PortAudio output path with Apple's AUHAL/CoreAudio APIs. It targets x86_64
@@ -66,6 +70,37 @@ precision. It preserves clock families: 44.1 kHz sources are converted only to
 highest synchronous rate the CoreAudio device reports. It is processed output
 and therefore never claims bit-perfect operation. Native remains the default.
 
+PCM Studio can also target an exact output rate. `auto` retains clock-family
+matching; a manual rate converts all PCM sources to that rate when the device
+reports it as supported. DoP bypasses PCM resampling.
+
+```sh
+tools/deploy-musicplayer-coreaudio-intel.sh upsample-rate auto
+tools/deploy-musicplayer-coreaudio-intel.sh upsample-rate 192000
+```
+
+The installer preserves the configured CoreAudio device. Use `default` for the
+current system output, or select a persistent name/ID explicitly:
+
+```sh
+tools/deploy-musicplayer-coreaudio-intel.sh device default
+tools/deploy-musicplayer-coreaudio-intel.sh install --device default
+```
+
+Native DSP configuration is versioned per player and controlled with:
+
+```sh
+tools/deploy-musicplayer-coreaudio-intel.sh dsp-apply player-dsp.json
+tools/deploy-musicplayer-coreaudio-intel.sh dsp-status --json
+tools/deploy-musicplayer-coreaudio-intel.sh dsp-get
+tools/deploy-musicplayer-coreaudio-intel.sh dsp-bypass on
+tools/deploy-musicplayer-coreaudio-intel.sh dsp-rollback
+```
+
+`dsp-apply` validates the complete document before replacing the active file.
+It retains the previous version and restores it automatically if the player
+cannot restart with the new configuration.
+
 Switch an installed candidate without reinstalling it:
 
 ```sh
@@ -121,3 +156,14 @@ After the transition matrix passes, run a representative one-hour test with
 should additionally complete a 24-hour run (`86400`) without new underruns,
 HAL overloads, clipping, or a player exit. The soak command is observational:
 it does not change the installed binary, mode, LMS playlist, or rollback state.
+
+Once implementation is complete, collect every Musicplayer check and its recent
+log in one timestamped report:
+
+```sh
+tools/run-musicplayer-test-suite.sh 300
+```
+
+The runner continues after individual failures so missing transition evidence
+and health failures appear together. It saves the complete output under
+`test-results/` and exits non-zero when any required section needs attention.

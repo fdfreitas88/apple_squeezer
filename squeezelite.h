@@ -121,6 +121,15 @@
 #define RESAMPLE_MP 0
 #endif
 
+#if defined(DSP)
+#undef DSP
+#define DSP       1
+#undef PROCESS
+#define PROCESS   1
+#else
+#define DSP       0
+#endif
+
 #if defined(ALAC)
 #undef ALAC
 #define ALAC    1
@@ -614,7 +623,7 @@ void process_samples(void);
 void process_drain(void);
 void process_flush(void);
 unsigned process_newstream(bool *direct, unsigned raw_sample_rate, unsigned supported_rates[]);
-void process_init(char *opt);
+void process_init(char *resample_opt, char *dsp_opt);
 #endif
 
 #if RESAMPLE
@@ -624,6 +633,52 @@ bool resample_drain(struct processstate *process);
 bool resample_newstream(struct processstate *process, unsigned raw_sample_rate, unsigned supported_rates[]);
 void resample_flush(void);
 bool resample_init(char *opt);
+unsigned resample_latency_frames(void);
+#endif
+
+#if DSP
+#define DSP_MAX_BIQUADS 32
+
+struct dsp_telemetry {
+	u64_t frames;
+	u64_t clipped_samples;
+	u64_t true_peak_overs;
+	u64_t config_swaps;
+	double peak_dbfs;
+	double true_peak_dbfs;
+	double applied_gain_db;
+	double response_peak_db;
+	double replaygain_db;
+	double loudness_compensation_db;
+	double limiter_gain_reduction_db;
+	u64_t limiter_events;
+	unsigned latency_frames;
+	unsigned fir_taps;
+	unsigned fir_partitions;
+	u64_t fir_checksum;
+	unsigned sample_rate;
+	bool limiter_active;
+	bool fir_active;
+};
+
+bool dsp_init(const char *opt);
+bool dsp_configure(const char *opt);
+bool dsp_validate(const char *opt);
+bool dsp_newstream(unsigned sample_rate);
+void dsp_process(s32_t *samples, frames_t frames);
+void dsp_flush(void);
+bool dsp_active(void);
+void dsp_get_telemetry(struct dsp_telemetry *telemetry);
+bool dsp_response_json(char *buffer, size_t capacity, unsigned points);
+unsigned dsp_latency_frames(void);
+void dsp_set_replaygain(u32_t gain);
+void dsp_set_volume(u32_t left, u32_t right);
+bool dsp_replaygain_managed(void);
+bool dsp_ir_load(const char *path, double **left, double **right, unsigned *taps,
+	unsigned *sample_rate, char *error, size_t error_capacity);
+char *dsp_config_load_options(const char *path, const char *expected_player);
+bool dsp_config_save(const char *path, const char *player, const char *json);
+bool dsp_config_rollback(const char *path);
 #endif
 
 // output.c output_alsa.c output_pa.c output_pack.c
@@ -742,6 +797,7 @@ bool test_open(const char *device, unsigned rates[], bool userdef_rates);
 void output_init_coreaudio(log_level level, const char *device, unsigned output_buf_size, char *params, unsigned rates[], unsigned rate_delay, unsigned idle);
 void output_close_coreaudio(void);
 void _coreaudio_open(void);
+void coreaudio_note_output_flush(void);
 #endif
 
 // output_pulse.c
