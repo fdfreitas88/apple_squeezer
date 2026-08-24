@@ -1,6 +1,8 @@
 .vscode/
+apple-squeezer-intel
 *.o
 squeezelite
 squeezelite-pulse
+third_party/*/build-intel/
 tools/alsacap
 tools/find_servers

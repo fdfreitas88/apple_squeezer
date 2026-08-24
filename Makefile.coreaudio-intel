@@ -1,0 +1,58 @@
+# Native CoreAudio technical candidate for Intel macOS 11 and newer.
+# Dependencies are loaded dynamically unless optional LINKALL is supplied.
+
+FLAC_BUILD = third_party/flac/build-intel
+FLAC_LIBRARY = $(FLAC_BUILD)/src/libFLAC/libFLAC.a
+OGG_BUILD = third_party/ogg/build-intel
+OGG_INSTALL = $(OGG_BUILD)/install
+OGG_LIBRARY = $(OGG_INSTALL)/lib/libogg.a
+SOXR_BUILD = third_party/soxr/build-intel
+SOXR_LIBRARY = $(SOXR_BUILD)/src/libsoxr.a
+
+OPTS = -DCOREAUDIO -DDSD -DALAC -DRESAMPLE -DLINKALL -DNO_FAAD -DNO_MAD -DNO_MPG123 -DNO_VORBIS \
+	-DMODEL_NAME=AppleSqueezerIntel -DCUSTOM_VERSION=-coreaudio-intel-rc1
+
+CFLAGS = -arch x86_64 -mmacosx-version-min=11.0 -Wall -Wextra -fPIC -O2 \
+	-Ithird_party/flac/include -Ithird_party/alac/codec -Ithird_party/soxr/src
+LDFLAGS = -arch x86_64 -mmacosx-version-min=11.0
+LDADD = -lpthread -lm
+LINKALL = $(FLAC_LIBRARY) $(OGG_LIBRARY)
+LINKALL_RESAMPLE = $(SOXR_LIBRARY)
+LINK_ALAC =
+SOURCES_ALAC = alac.c alac_wrapper.cpp \
+	third_party/alac/codec/EndianPortable.c \
+	third_party/alac/codec/ALACBitUtilities.c \
+	third_party/alac/codec/ALACDecoder.cpp \
+	third_party/alac/codec/ag_dec.c \
+	third_party/alac/codec/dp_dec.c \
+	third_party/alac/codec/matrix_dec.c
+EXECUTABLE = apple-squeezer-intel
+
+include Makefile
+
+$(EXECUTABLE): $(FLAC_LIBRARY) $(OGG_LIBRARY) $(SOXR_LIBRARY)
+
+$(SOXR_LIBRARY):
+	cmake -S third_party/soxr -B $(SOXR_BUILD) \
+		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+		-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+		-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DBUILD_SHARED_LIBS=OFF \
+		-DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DWITH_OPENMP=OFF \
+		-DWITH_LSR_BINDINGS=OFF
+	cmake --build $(SOXR_BUILD) --target soxr -j4
+
+$(OGG_LIBRARY):
+	cmake -S third_party/ogg -B $(OGG_BUILD) \
+		-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+		-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_INSTALL_PREFIX=$(abspath $(OGG_INSTALL)) \
+		-DBUILD_SHARED_LIBS=OFF -DBUILD_FRAMEWORK=OFF -DINSTALL_DOCS=OFF
+	cmake --build $(OGG_BUILD) --target install -j4
+
+$(FLAC_LIBRARY): $(OGG_LIBRARY)
+	cmake -S third_party/flac -B $(FLAC_BUILD) \
+		-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+		-DCMAKE_PREFIX_PATH=$(abspath $(OGG_INSTALL)) \
+		-DBUILD_CXXLIBS=OFF -DBUILD_PROGRAMS=OFF -DBUILD_EXAMPLES=OFF \
+		-DBUILD_TESTING=OFF -DBUILD_DOCS=OFF -DINSTALL_MANPAGES=OFF \
+		-DWITH_OGG=ON -DENABLE_MULTITHREADING=OFF -DBUILD_SHARED_LIBS=OFF
+	cmake --build $(FLAC_BUILD) --target FLAC -j4

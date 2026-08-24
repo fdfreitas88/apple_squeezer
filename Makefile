@@ -15,22 +15,25 @@ OPT_IR         = -DIR
 OPT_GPIO       = -DGPIO
 OPT_RPI        = -DRPI
 OPT_NO_FAAD    = -DNO_FAAD
+OPT_NO_FLAC    = -DNO_FLAC
 OPT_NO_MAD     = -DNO_MAD
 OPT_NO_MPG123  = -DNO_MPG123
+OPT_NO_VORBIS  = -DNO_VORBIS
 OPT_SSL        = -DUSE_SSL
 OPT_NOSSLSYM   = -DNO_SSLSYM
 OPT_OPUS       = -DOPUS
 OPT_PORTAUDIO  = -DPORTAUDIO
+OPT_COREAUDIO  = -DCOREAUDIO
 OPT_PULSEAUDIO = -DPULSEAUDIO
 
 SOURCES = \
 	main.c slimproto.c buffer.c stream.c utils.c \
-	output.c output_alsa.c output_pa.c output_stdout.c output_pack.c output_pulse.c decode.c \
-	flac.c pcm.c vorbis.c
+	output.c output_alsa.c output_pa.c output_coreaudio.c output_stdout.c output_pack.c output_pulse.c decode.c \
+	pcm.c
 
 SOURCES_DSD      = dsd.c dop.c dsd2pcm/dsd2pcm.c
 SOURCES_FF       = ffmpeg.c
-SOURCES_ALAC     = alac.c alac_wrapper.cpp
+SOURCES_ALAC     ?= alac.c alac_wrapper.cpp
 SOURCES_RESAMPLE = process.c resample.c
 SOURCES_VIS      = output_vis.c
 SOURCES_IR       = ir.c
@@ -40,25 +43,28 @@ SOURCES_SSL      = sslsym.c
 SOURCES_OPUS     = opus.c
 SOURCES_MAD      = mad.c
 SOURCES_MPG123   = mpg.c
+SOURCES_FLAC     = flac.c
+SOURCES_VORBIS   = vorbis.c
 
 LINK_LINUX       = -ldl
 LINK_ALSA        = -lasound
 LINK_PORTAUDIO   = -lportaudio
+LINK_COREAUDIO   = -framework CoreAudio -framework AudioToolbox -framework AudioUnit -framework CoreFoundation
 LINK_PULSEAUDIO  = -lpulse
 LINK_RPI         = -lgpiod
 LINK_SSL         = -lssl -lcrypto
-LINK_ALAC        = -lalac
+LINK_ALAC        ?= -lalac
 
-LINKALL          = -lFLAC -lvorbisfile -lvorbis -logg
+LINKALL          ?= -lFLAC -lvorbisfile -lvorbis -logg
 LINKALL_FF       = -lavformat -lavcodec -lavutil
-LINKALL_RESAMPLE = -lsoxr
+LINKALL_RESAMPLE ?= -lsoxr
 LINKALL_IR       = -llirc_client
 LINKALL_FAAD     = -lfaad
 LINKALL_OPUS     = -lopusfile -lopus
 LINKALL_MAD      = -lmad
 LINKALL_MPG123   = -lmpg123
 
-DEPS             = squeezelite.h slimproto.h
+DEPS             = squeezelite.h slimproto.h flac_pcm.h
 
 UNAME            = $(shell uname -s)
 
@@ -97,6 +103,12 @@ endif
 endif
 ifeq (,$(findstring $(OPT_NO_FAAD), $(OPTS)))
 	SOURCES += $(SOURCES_FAAD)
+endif
+ifeq (,$(findstring $(OPT_NO_FLAC), $(OPTS)))
+	SOURCES += $(SOURCES_FLAC)
+endif
+ifeq (,$(findstring $(OPT_NO_VORBIS), $(OPTS)))
+	SOURCES += $(SOURCES_VORBIS)
 endif
 ifneq (,$(findstring $(OPT_SSL), $(OPTS)))
 	SOURCES += $(SOURCES_SSL)
@@ -147,6 +159,8 @@ endif
 
 ifneq (,$(findstring $(OPT_PULSEAUDIO), $(OPTS)))
 	LDADD += $(LINK_PULSEAUDIO)
+else ifneq (,$(findstring $(OPT_COREAUDIO), $(OPTS)))
+	LDADD += $(LINK_COREAUDIO)
 else ifneq (,$(findstring $(OPT_PORTAUDIO), $(OPTS)))
 	LDADD += $(LINK_PORTAUDIO)
 else
@@ -175,7 +189,7 @@ endif
 $(OBJECTS): $(DEPS)
 
 .cpp.o:
-	$(CXX) $(CXXFLAGS) $(CFLAGS) $(CPPFLAGS) $(OPTS) -Wno-multichar $< -c -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out -std=gnu99,$(CFLAGS)) -std=gnu++11 $(CPPFLAGS) $(OPTS) -Wno-multichar $< -c -o $@
 
 .c.o:
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(OPTS) $< -c -o $@

@@ -20,6 +20,7 @@
  */
 
 #include "squeezelite.h"
+#include "flac_pcm.h"
 
 #include <FLAC/stream_decoder.h>
 
@@ -46,12 +47,18 @@
 struct flac {
 	FLAC__StreamDecoder *decoder;
 	u8_t container;
+	bool initialized;
+	bool md5_checking;
+	bool integrity_reported;
 #if !LINKALL
 	// FLAC symbols to be dynamically loaded
 	const char **FLAC__StreamDecoderErrorStatusString;
 	const char **FLAC__StreamDecoderStateString;
+	const char **FLAC__StreamDecoderInitStatusString;
 	FLAC__StreamDecoder * (* FLAC__stream_decoder_new)(void);
 	FLAC__bool (* FLAC__stream_decoder_reset)(FLAC__StreamDecoder *decoder);
+	FLAC__bool (* FLAC__stream_decoder_finish)(FLAC__StreamDecoder *decoder);
+	FLAC__bool (* FLAC__stream_decoder_set_md5_checking)(FLAC__StreamDecoder *decoder, FLAC__bool value);
 	void (* FLAC__stream_decoder_delete)(FLAC__StreamDecoder *decoder);
 	FLAC__StreamDecoderInitStatus (* FLAC__stream_decoder_init_stream)(
 		FLAC__StreamDecoder *decoder,
@@ -130,8 +137,10 @@ static void metadata_cb(const FLAC__StreamDecoder* decoder, const FLAC__StreamMe
 		break;
 	case FLAC__METADATA_TYPE_VORBIS_COMMENT: {
 		FLAC__StreamMetadata_VorbisComment_Entry* comment = metadata->data.vorbis_comment.comments;
-		for (int i = 0; i < metadata->data.vorbis_comment.num_comments; i++, comment++) {
-			LOG_INFO("stream metadata %*s", comment->length, comment->entry);
+		for (FLAC__uint32 i = 0; i < metadata->data.vorbis_comment.num_comments; i++, comment++) {
+			int length = comment->length > 4096 ? 4096 : (int)comment->length;
+			LOG_INFO("stream metadata %.*s%s", length, (const char *)comment->entry,
+					 comment->length > 4096 ? "..." : "");
 		}
 	}
 	default:
@@ -168,8 +177,17 @@ static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decode
 	unsigned bits_per_sample = frame->header.bits_per_sample;
 	unsigned channels = frame->header.channels;
 
-	FLAC__int32 *lptr = (FLAC__int32 *)buffer[0];
-	FLAC__int32 *rptr = (FLAC__int32 *)buffer[channels > 1 ? 1 : 0];
+	if (channels < 1 || channels > 2) {
+		LOG_ERROR("unsupported FLAC channel count: %u (stereo output supports one or two channels)", channels);
+		return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+	}
+	if (bits_per_sample < 4 || bits_per_sample > 32) {
+		LOG_ERROR("unsupported FLAC bits per sample: %u", bits_per_sample);
+		return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+	}
+
+	const FLAC__int32 *lptr = buffer[0];
+	const FLAC__int32 *rptr = buffer[channels > 1 ? 1 : 0];
 	
 	if (decode.new_stream) {
 		LOCK_O;
@@ -224,33 +242,14 @@ static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decode
 
 		count = f;
 
-		if (bits_per_sample == 8) {
-			while (count--) {
-				*optr++ = ALIGN8(*lptr++);
-				*optr++ = ALIGN8(*rptr++);
-			}
-		} else if (bits_per_sample == 16) {
-			while (count--) {
-				*optr++ = ALIGN16(*lptr++);
-				*optr++ = ALIGN16(*rptr++);
-			}
-		} else if (bits_per_sample == 20) {
-			while (count--) {
-				*optr++ = ALIGN24(*lptr++ << 4);
-				*optr++ = ALIGN24(*rptr++ << 4);
-			}
-		} else if ( bits_per_sample == 24) {
-			while (count--) {
-				*optr++ = ALIGN24(*lptr++);
-				*optr++ = ALIGN24(*rptr++);
-			}
-		} else if (bits_per_sample == 32) {
-			while (count--) {
-				*optr++ = ALIGN32(*lptr++);
-				*optr++ = ALIGN32(*rptr++);
-			}
-		} else {
-			LOG_ERROR("unsupported bits per sample: %u", bits_per_sample);
+		while (count--) {
+#if BYTES_PER_FRAME == 4
+			*optr++ = (ISAMPLE_T)flac_scale_sample(*lptr++, bits_per_sample, 16);
+			*optr++ = (ISAMPLE_T)flac_scale_sample(*rptr++, bits_per_sample, 16);
+#else
+			*optr++ = (ISAMPLE_T)flac_scale_sample(*lptr++, bits_per_sample, 32);
+			*optr++ = (ISAMPLE_T)flac_scale_sample(*rptr++, bits_per_sample, 32);
+#endif
 		}
 
 		frames -= f;
@@ -274,21 +273,36 @@ static void error_cb(const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErro
 }
 
 static void flac_close(void) {
+	if (!f || !f->decoder) return;
+	if (f->initialized) {
+		bool verified = FLAC(f, stream_decoder_finish, f->decoder);
+		if (f->md5_checking && !f->integrity_reported) {
+			LOG_INFO("FLAC integrity: %s", verified ? "MD5 verified" : "MD5 mismatch or incomplete stream");
+			f->integrity_reported = true;
+		}
+	}
 	FLAC(f, stream_decoder_delete, f->decoder);
 	f->decoder = NULL;
+	f->initialized = false;
 }
 
 static void flac_open(u8_t sample_size, u8_t sample_rate, u8_t channels, u8_t endianness) {
-	if ( f->decoder && f->container != sample_size ) {
-		flac_close();
-	}
-
+	FLAC__StreamDecoderInitStatus status;
+	(void)sample_rate;
+	(void)channels;
+	(void)endianness;
+	flac_close();
 	f->container = sample_size;
-
-	if (f->decoder) {
-		FLAC(f, stream_decoder_reset, f->decoder);
-	} else {
-		f->decoder = FLAC(f, stream_decoder_new);
+	f->integrity_reported = false;
+	f->decoder = FLAC(f, stream_decoder_new);
+	if (!f->decoder) {
+		LOG_ERROR("FLAC decoder allocation failed");
+		return;
+	}
+	if (!FLAC(f, stream_decoder_set_md5_checking, f->decoder, f->md5_checking)) {
+		LOG_ERROR("FLAC decoder rejected MD5 checking configuration");
+		flac_close();
+		return;
 	}
 	
 	if ( f->container == 'o' ) {
@@ -296,22 +310,43 @@ static void flac_open(u8_t sample_size, u8_t sample_rate, u8_t channels, u8_t en
 
 #if FLAC_API_VERSION_CURRENT >= 14
 #if LINKALL
-		FLAC__stream_decoder_set_decode_chained_stream(f->decoder, true);
+		if (!FLAC__stream_decoder_set_decode_chained_stream(f->decoder, true)) {
+			LOG_ERROR("FLAC decoder rejected chained Ogg FLAC configuration");
+			flac_close();
+			return;
+		}
 #else
-		FLAC(f, stream_decoder_set_decode_chained_stream, f->decoder, true);
+		if (!FLAC(f, stream_decoder_set_decode_chained_stream, f->decoder, true)) {
+			LOG_ERROR("FLAC decoder rejected chained Ogg FLAC configuration");
+			flac_close();
+			return;
+		}
 #endif
 		LOG_INFO("using chained stream decoding");
 #else
 		#pragma message ("OggFlac library does not support chaining") 
 #endif
-		FLAC(f, stream_decoder_set_metadata_respond, f->decoder, FLAC__METADATA_TYPE_VORBIS_COMMENT);
-		FLAC(f, stream_decoder_init_ogg_stream, f->decoder, &read_cb, NULL, NULL, NULL, NULL, &write_cb, &metadata_cb, &error_cb, NULL);
+		if (!FLAC(f, stream_decoder_set_metadata_respond, f->decoder, FLAC__METADATA_TYPE_VORBIS_COMMENT)) {
+			LOG_ERROR("FLAC decoder rejected Vorbis comment metadata configuration");
+			flac_close();
+			return;
+		}
+		status = FLAC(f, stream_decoder_init_ogg_stream, f->decoder, &read_cb, NULL, NULL, NULL, NULL, &write_cb, &metadata_cb, &error_cb, NULL);
 	} else {
-		FLAC(f, stream_decoder_init_stream, f->decoder, &read_cb, NULL, NULL, NULL, NULL, &write_cb, NULL, &error_cb, NULL);
+		status = FLAC(f, stream_decoder_init_stream, f->decoder, &read_cb, NULL, NULL, NULL, NULL, &write_cb, NULL, &error_cb, NULL);
 	}
+	if (status != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+		LOG_ERROR("FLAC decoder initialization failed: %s", FLAC_A(f, StreamDecoderInitStatusString)[status]);
+		flac_close();
+		return;
+	}
+	f->initialized = true;
+	LOG_INFO("FLAC decoder initialized (%s, integrity %s)",
+			 f->container == 'o' ? "Ogg FLAC" : "native FLAC", f->md5_checking ? "MD5 enabled" : "MD5 disabled");
 }
 
 static decode_state flac_decode(void) {
+	if (!f || !f->decoder || !f->initialized) return DECODE_ERROR;
 	bool ok = FLAC(f, stream_decoder_process_single, f->decoder);
 	FLAC__StreamDecoderState state = FLAC(f, stream_decoder_get_state, f->decoder);
 	
@@ -356,8 +391,11 @@ static bool load_flac() {
 
 	f->FLAC__StreamDecoderErrorStatusString = dlsym(handle, "FLAC__StreamDecoderErrorStatusString");
 	f->FLAC__StreamDecoderStateString = dlsym(handle, "FLAC__StreamDecoderStateString");
+	f->FLAC__StreamDecoderInitStatusString = dlsym(handle, "FLAC__StreamDecoderInitStatusString");
 	f->FLAC__stream_decoder_new = dlsym(handle, "FLAC__stream_decoder_new");
 	f->FLAC__stream_decoder_reset = dlsym(handle, "FLAC__stream_decoder_reset");
+	f->FLAC__stream_decoder_finish = dlsym(handle, "FLAC__stream_decoder_finish");
+	f->FLAC__stream_decoder_set_md5_checking = dlsym(handle, "FLAC__stream_decoder_set_md5_checking");
 	f->FLAC__stream_decoder_delete = dlsym(handle, "FLAC__stream_decoder_delete");
 	f->FLAC__stream_decoder_init_stream = dlsym(handle, "FLAC__stream_decoder_init_stream");
 	f->FLAC__stream_decoder_init_ogg_stream = dlsym(handle, "FLAC__stream_decoder_init_ogg_stream");
@@ -398,7 +436,11 @@ struct codec *register_flac(void) {
 		return NULL;
 	}
 
-	f->decoder = NULL;
+	memset(f, 0, sizeof(*f));
+	{
+		const char *integrity = getenv("SQUEEZELITE_FLAC_MD5");
+		f->md5_checking = integrity && (!strcmp(integrity, "1") || !strcasecmp(integrity, "true") || !strcasecmp(integrity, "yes"));
+	}
 
 	if (!load_flac()) {
 		return NULL;

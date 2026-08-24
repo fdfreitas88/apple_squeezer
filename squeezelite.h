@@ -53,7 +53,9 @@
 #define LINUX     0
 #define OSX       1
 #define WIN       0
+#if !defined(COREAUDIO)
 #define PORTAUDIO 1
+#endif
 #define FREEBSD   0
 #elif defined (_MSC_VER)
 #define LINUX     0
@@ -659,6 +661,9 @@ struct outputstate {
 	unsigned latency;
 	int pa_hostapi_option;
 #endif
+#if COREAUDIO
+	bool coreaudio_reopen;
+#endif
 	int (* write_cb)(frames_t out_frames, bool silence, s32_t gainL, s32_t gainR, u8_t flags, s32_t cross_gain_in, s32_t cross_gain_out, s32_t **cross_ptr);
 	unsigned start_frames;
 	unsigned frames_played;
@@ -727,6 +732,16 @@ bool test_open(const char *device, unsigned rates[], bool userdef_rates);
 void output_init_pa(log_level level, const char *device, unsigned output_buf_size, char *params, unsigned rates[], unsigned rate_delay, unsigned idle);
 void output_close_pa(void);
 void _pa_open(void);
+#endif
+
+// output_coreaudio.c
+#if COREAUDIO
+void list_devices(void);
+void set_volume(unsigned left, unsigned right);
+bool test_open(const char *device, unsigned rates[], bool userdef_rates);
+void output_init_coreaudio(log_level level, const char *device, unsigned output_buf_size, char *params, unsigned rates[], unsigned rate_delay, unsigned idle);
+void output_close_coreaudio(void);
+void _coreaudio_open(void);
 #endif
 
 // output_pulse.c
@@ -821,4 +836,3 @@ bool load_ssl_symbols(void);
 void free_ssl_symbols(void);
 bool ssl_loaded;
 #endif
-

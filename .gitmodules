@@ -1,0 +1,12 @@
+[submodule "third_party/flac"]
+	path = third_party/flac
+	url = https://github.com/xiph/flac.git
+[submodule "third_party/alac"]
+	path = third_party/alac
+	url = https://github.com/macosforge/alac.git
+[submodule "third_party/ogg"]
+	path = third_party/ogg
+	url = https://github.com/xiph/ogg.git
+[submodule "third_party/soxr"]
+	path = third_party/soxr
+	url = https://github.com/chirlu/soxr.git

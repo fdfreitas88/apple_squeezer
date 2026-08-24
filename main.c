@@ -28,7 +28,17 @@
 
 #define TITLE "Squeezelite " VERSION ", Copyright 2012-2015 Adrian Smith, 2015-2026 Ralph Irving."
 
-#define CODECS_BASE "flac,pcm,ogg"
+#ifdef NO_FLAC
+#define CODECS_FLAC "pcm"
+#else
+#define CODECS_FLAC "flac,pcm"
+#endif
+#ifdef NO_VORBIS
+#define CODECS_VORBIS ""
+#else
+#define CODECS_VORBIS ",ogg"
+#endif
+#define CODECS_BASE CODECS_FLAC CODECS_VORBIS
 #if NO_FAAD
 #define CODECS_AAC  ""
 #else
@@ -107,6 +117,9 @@ static void usage(const char *argv0) {
 #if ALSA
 		   "  -p <priority>\t\tSet real time priority of output thread (1-99)\n"
 #endif
+#if COREAUDIO
+		   "  -a <params>\t\tCoreAudio options separated by ':' or ',': mode=native|pcm-studio,exclusive,bitperfect,dither,headroom=0..12,profile=safe|balanced|lowlatency\n"
+#endif
 #if LINUX || FREEBSD || SUN
 		   "  -P <filename>\t\tStore the process id (PID) in filename\n"
 #endif
@@ -180,6 +193,9 @@ static void usage(const char *argv0) {
 #endif
 #if PULSEAUDIO
 		   " PULSEAUDIO"
+#endif
+#if COREAUDIO
+		   " COREAUDIO"
 #endif
 #if EVENTFD
 		   " EVENTFD"
@@ -797,6 +813,9 @@ int main(int argc, char **argv) {
 #if PORTAUDIO
 		output_init_pa(log_output, output_device, output_buf_size, output_params, rates, rate_delay, idle);
 #endif
+#if COREAUDIO
+		output_init_coreaudio(log_output, output_device, output_buf_size, output_params, rates, rate_delay, idle);
+#endif
 #if PULSEAUDIO
 		output_init_pulse(log_output, output_device, output_buf_size, output_params, rates, rate_delay, idle);
 #endif
@@ -868,6 +887,9 @@ int main(int argc, char **argv) {
 #endif
 #if PORTAUDIO
 		output_close_pa();
+#endif
+#if COREAUDIO
+		output_close_coreaudio();
 #endif
 #if PULSEAUDIO
 		output_close_pulse();

@@ -710,6 +710,14 @@ static void slimproto_run() {
 				output.pa_reopen = false;
 			}
 #endif
+#if COREAUDIO
+			if (output.coreaudio_reopen) {
+				output.coreaudio_reopen = false;
+				UNLOCK_O;
+				_coreaudio_open();
+				LOCK_O;
+			}
+#endif
 			if (_start_output && (output.state == OUTPUT_STOPPED || output.state == OUTPUT_OFF)) {
 				output.state = OUTPUT_BUFFER;
 			}
