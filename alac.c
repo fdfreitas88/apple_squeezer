@@ -39,6 +39,7 @@
 #define BLOCK_SIZE (4096 * BYTES_PER_FRAME)
 #define MIN_READ    BLOCK_SIZE
 #define MIN_SPACE  (MIN_READ * 4)
+#define MAX_ALAC_BLOCK (64U * 1024U * 1024U)
 
 struct chunk_table {
 	u32_t sample, offset;
@@ -52,7 +53,9 @@ struct alac {
 	u32_t pos;
 	u32_t sample;
 	u32_t nextchunk;
+	u32_t block_count;
 	void *stsc;
+	size_t stsc_size;
 	u32_t skip;
 	u64_t samples;
 	u64_t sttssamples;
@@ -108,6 +111,10 @@ static int read_mp4_header(void) {
 		len = unpackN((u32_t *)streambuf->readp);
 		memcpy(type, streambuf->readp + 4, 4);
 		type[4] = '\0';
+		if (len < 8) {
+			LOG_ERROR("invalid MP4 atom %s length: %u", type, len);
+			return -1;
+		}
 
 		if (!strcmp(type, "moov")) {
 			l->trak = 0;
@@ -118,12 +125,20 @@ static int read_mp4_header(void) {
 		}
 
 		// extract audio config from within alac
-		if (!strcmp(type, "alac") && bytes > len) {
+		if (!strcmp(type, "alac") && len >= 36 && bytes >= len) {
 			u8_t *ptr = streambuf->readp + 36;
 			unsigned int block_size;
+			if (l->decoder) { alac_delete_decoder(l->decoder); l->decoder = NULL; }
+			free(l->writebuf); l->writebuf = NULL;
 			l->play = l->trak;						
 			l->decoder = alac_create_decoder(len - 36, ptr, &l->sample_size, &l->sample_rate, &l->channels, &block_size);
-			l->writebuf = malloc(block_size + 256);
+			if (!l->decoder || !block_size || block_size > MAX_ALAC_BLOCK ||
+				!l->sample_rate || (l->channels != 1 && l->channels != 2) ||
+				(l->sample_size != 8 && l->sample_size != 16 && l->sample_size != 24 && l->sample_size != 32)) {
+				LOG_ERROR("invalid ALAC configuration");
+				return -1;
+			}
+			l->writebuf = malloc((size_t)block_size + 256U);
 			LOG_INFO("allocated write buffer of %u bytes", block_size);
 			if (!l->writebuf) {
 				LOG_ERROR("allocation failed");
@@ -132,15 +147,29 @@ static int read_mp4_header(void) {
 		}
 
 		// extract the total number of samples from stts
-		if (!strcmp(type, "stsz") && bytes > len) {
-			u32_t i;
+		if (!strcmp(type, "stsz") && bytes >= len) {
+			u32_t i, entries;
+			if (len < 20) return -1;
 			u8_t *ptr = streambuf->readp + 12;
 			l->default_block_size = unpackN((u32_t *) ptr); ptr += 4;
+			entries = unpackN((u32_t *)ptr); ptr += 4;
+			if (!entries || (l->default_block_size && l->default_block_size > streambuf->size)) {
+				LOG_ERROR("invalid stsz fixed size/count");
+				return -1;
+			}
+			l->block_count = entries;
 			if (!l->default_block_size) {
-				u32_t entries = unpackN((u32_t *)ptr); ptr += 4;
-				l->block_size = malloc((entries + 1)* 4);
+				if (!entries || entries > (len - 20U) / 4U ||
+					(size_t)entries + 1U > SIZE_MAX / sizeof(*l->block_size)) {
+					LOG_ERROR("invalid stsz entry count: %u", entries);
+					return -1;
+				}
+				free(l->block_size);
+				l->block_size = malloc(((size_t)entries + 1U) * sizeof(*l->block_size));
+				if (!l->block_size) return -1;
 				for (i = 0; i < entries; i++) {
 					l->block_size[i] = unpackN((u32_t *)ptr); ptr += 4;
+					if (!l->block_size[i] || l->block_size[i] > streambuf->size) return -1;
 				}
 				l->block_size[entries] = 0;
 				LOG_DEBUG("total blocksize contained in stsz %u", entries);
@@ -150,38 +179,47 @@ static int read_mp4_header(void) {
 		}
 
 		// extract the total number of samples from stts
-		if (!strcmp(type, "stts") && bytes > len) {
+		if (!strcmp(type, "stts") && bytes >= len) {
 			u32_t i;
+			if (len < 16) return -1;
 			u8_t *ptr = streambuf->readp + 12;
 			u32_t entries = unpackN((u32_t *)ptr);
+			if (entries > (len - 16U) / 8U) return -1;
 			ptr += 4;
 			for (i = 0; i < entries; ++i) {
 				u32_t count = unpackN((u32_t *)ptr);
 				u32_t size = unpackN((u32_t *)(ptr + 4));
-				l->sttssamples += count * size;
+				l->sttssamples += (u64_t)count * size;
 				ptr += 8;
 			}
 			LOG_DEBUG("total number of samples contained in stts: " FMT_u64, l->sttssamples);
 		}
 
 		// stash sample to chunk info, assume it comes before stco
-		if (!strcmp(type, "stsc") && bytes > len && !l->chunkinfo) {
+		if (!strcmp(type, "stsc") && bytes >= len && !l->chunkinfo) {
+			if (len < 16 || unpackN((u32_t *)(streambuf->readp + 12)) > (len - 16U) / 12U) return -1;
+			free(l->stsc);
 			l->stsc = malloc(len - 12);
 			if (l->stsc == NULL) {
 				LOG_WARN("malloc fail");
 				return -1;
 			}
 			memcpy(l->stsc, streambuf->readp + 12, len - 12);
+			l->stsc_size = len - 12;
 		}
 
 		// build offsets table from stco and stored stsc
-		if (!strcmp(type, "stco") && bytes > len && l->play == l->trak) {
+		if (!strcmp(type, "stco") && bytes >= len && l->play == l->trak) {
 			u32_t i;
+			if (len < 16) return -1;
 			// extract chunk offsets
 			u8_t *ptr = streambuf->readp + 12;
 			u32_t entries = unpackN((u32_t *)ptr);
 			ptr += 4;
-			l->chunkinfo = malloc(sizeof(struct chunk_table) * (entries + 1));
+			if (!entries || entries > (len - 16U) / 4U ||
+				(size_t)entries + 1U > SIZE_MAX / sizeof(*l->chunkinfo)) return -1;
+			free(l->chunkinfo);
+			l->chunkinfo = malloc(sizeof(struct chunk_table) * ((size_t)entries + 1U));
 			if (l->chunkinfo == NULL) {
 				LOG_WARN("malloc fail");
 				return -1;
@@ -199,9 +237,11 @@ static int read_mp4_header(void) {
 				u32_t sample = 0;
 				u32_t last = 0, last_samples = 0;
 				u8_t *ptr = (u8_t *)l->stsc + 4;
+				if (l->stsc_size < 4 || stsc_entries > (l->stsc_size - 4U) / 12U) return -1;
 				while (stsc_entries--) {
 					u32_t first = unpackN((u32_t *)ptr);
 					u32_t samples = unpackN((u32_t *)(ptr + 4));
+					if (!first || first > entries || !samples || (last && first <= last)) return -1;
 					if (last) {
 						for (i = last - 1; i < first - 1; ++i) {
 							l->chunkinfo[i].sample = sample;
@@ -220,6 +260,7 @@ static int read_mp4_header(void) {
 				}
 				free(l->stsc);
 				l->stsc = NULL;
+				l->stsc_size = 0;
 			}
 		}
 
@@ -228,7 +269,7 @@ static int read_mp4_header(void) {
 			_buf_inc_readp(streambuf, 8);
 			l->pos += 8;
 			bytes  -= 8;
-			if (l->play) {
+			if (l->play && l->decoder && l->writebuf && (l->default_block_size || l->block_size)) {
 				LOG_DEBUG("type: mdat len: %u pos: %u", len, l->pos);
 				if (l->chunkinfo && l->chunkinfo[0].offset > l->pos) {
 					u32_t skip = l->chunkinfo[0].offset - l->pos;
@@ -250,23 +291,29 @@ static int read_mp4_header(void) {
 		}
 
 		// parse key-value atoms within ilst ---- entries to get encoder padding within iTunSMPB entry for gapless
-		if (!strcmp(type, "----") && bytes > len) {
+		if (!strcmp(type, "----") && len >= 8 && bytes >= len) {
 			u8_t *ptr = streambuf->readp + 8;
 			u32_t remain = len - 8, size;
-			if (!memcmp(ptr + 4, "mean", 4) && (size = unpackN((u32_t *)ptr)) < remain) {
+			if (remain >= 8 && !memcmp(ptr + 4, "mean", 4) && (size = unpackN((u32_t *)ptr)) >= 8 && size <= remain) {
 				ptr += size; remain -= size;
 			}
-			if (!memcmp(ptr + 4, "name", 4) && (size = unpackN((u32_t *)ptr)) < remain && !memcmp(ptr + 12, "iTunSMPB", 8)) {
+			if (remain >= 20 && !memcmp(ptr + 4, "name", 4) && (size = unpackN((u32_t *)ptr)) >= 20 && size <= remain && !memcmp(ptr + 12, "iTunSMPB", 8)) {
 				ptr += size; remain -= size;
 			}
-			if (!memcmp(ptr + 4, "data", 4) && remain > 16 + 48) {
+			if (remain > 16 + 48 && !memcmp(ptr + 4, "data", 4) &&
+				(size = unpackN((u32_t *)ptr)) >= 16 && size <= remain) {
 				// data is stored as hex strings: 0 start end samples
 				u32_t b, c; u64_t d;
-				if (sscanf((const char *)(ptr + 16), "%x %x %x " FMT_x64, &b, &b, &c, &d) == 4) {
+				char text[129];
+				size_t text_len = min((size_t)size - 16, sizeof(text) - 1);
+				memcpy(text, ptr + 16, text_len);
+				text[text_len] = '\0';
+				if (sscanf(text, "%x %x %x " FMT_x64, &b, &b, &c, &d) == 4) {
 					LOG_DEBUG("iTunSMPB start: %u end: %u samples: " FMT_u64, b, c, d);
-					if (l->sttssamples && l->sttssamples < b + c + d) {
+					if (l->sttssamples && (d > l->sttssamples ||
+						(u64_t)b + c > l->sttssamples - d)) {
 						LOG_DEBUG("reducing samples as stts count is less");
-						d = l->sttssamples - (b + c);
+						d = (u64_t)b + c < l->sttssamples ? l->sttssamples - ((u64_t)b + c) : 0;
 					}
 					l->skip = b;
 					l->samples = d;
@@ -286,6 +333,10 @@ static int read_mp4_header(void) {
 		if (!strcmp(type, "stsd")) consume = 16;
 		if (!strcmp(type, "mp4a")) consume = 36;
 		if (!strcmp(type, "meta")) consume = 12;
+		if (consume < 8 || consume > len) {
+			LOG_ERROR("invalid MP4 atom nesting for %s", type);
+			return -1;
+		}
 
 		// consume rest of box if it has been parsed (all in the buffer) or is not one we want to parse
 		if (bytes >= consume) {
@@ -340,8 +391,6 @@ static decode_state alac_decode(void) {
 		found = read_mp4_header();
 
 		if (found == 1) {
-			bytes = min(_buf_used(streambuf), _buf_cont_read(streambuf));
-
 			LOG_INFO("setting track_start");
 			LOCK_O;
 
@@ -364,6 +413,14 @@ static decode_state alac_decode(void) {
 	}
 
 	bytes = _buf_used(streambuf);
+	if (!l->default_block_size && !l->block_size) {
+		UNLOCK_S;
+		return DECODE_ERROR;
+	}
+	if (l->block_index >= l->block_count) {
+		UNLOCK_S;
+		return DECODE_COMPLETE;
+	}
 	block_size = l->default_block_size ? l->default_block_size : l->block_size[l->block_index];
 
 	// stream terminated
@@ -377,19 +434,24 @@ static decode_state alac_decode(void) {
 	if (bytes < block_size) {
 		UNLOCK_S;
 		return DECODE_RUNNING;
-	} else if (block_size != l->default_block_size) l->block_index++;
+	} else l->block_index++;
 
 	bytes = min(bytes, _buf_cont_read(streambuf));
 
 	// need to create a buffer with contiguous data
 	if (bytes < block_size) {
 		iptr = malloc(block_size);
+		if (!iptr) {
+			UNLOCK_S;
+			return DECODE_ERROR;
+		}
 		memcpy(iptr, streambuf->readp, bytes);
 		memcpy(iptr + bytes, streambuf->buf, block_size - bytes);
 	} else iptr = streambuf->readp;
 
 	if (!alac_to_pcm(l->decoder, iptr, l->writebuf, 2, &frames)) {
 		LOG_ERROR("decode error");
+		if (bytes < block_size) free(iptr);
 		UNLOCK_S;
 		return DECODE_ERROR;
 	}
@@ -529,6 +591,7 @@ static void alac_close(void) {
 }
 
 static void alac_open(u8_t size, u8_t rate, u8_t chan, u8_t endianness) {
+	(void)size; (void)rate; (void)chan; (void)endianness;
 	alac_close();
 }
 

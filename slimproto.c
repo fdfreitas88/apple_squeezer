@@ -194,7 +194,7 @@ static void sendSTAT(const char *event, u32_t server_timestamp) {
 
 	LOG_DEBUG("STAT: %s", event);
 
-	if (loglevel == lSDEBUG) {
+	if (loglevel == lSDEBUG && status.current_sample_rate) {
 		LOG_SDEBUG("received bytesL: %u streambuf: %u outputbuf: %u calc elapsed: %u real elapsed: %u (diff: %d) device: %u delay: %d",
 				   (u32_t)status.stream_bytes, status.stream_full, status.output_full, ms_played, now - status.stream_start,
 				   ms_played - now + status.stream_start, status.device_frames * 1000 / status.current_sample_rate, now - status.updated);
@@ -401,6 +401,7 @@ static void process_strm(u8_t *pkt, int len) {
 }
 
 static void process_cont(u8_t *pkt, int len) {
+	(void)len;
 	struct cont_packet *cont = (struct cont_packet *)pkt;
 	cont->metaint = unpackN(&cont->metaint);
 
@@ -419,6 +420,7 @@ static void process_cont(u8_t *pkt, int len) {
 }
 
 static void process_codc(u8_t *pkt, int len) {
+	(void)len;
 	struct codc_packet *codc = (struct codc_packet *)pkt;
 
 	LOG_DEBUG("codc: %c", codc->format);
@@ -426,6 +428,7 @@ static void process_codc(u8_t *pkt, int len) {
 }
 
 static void process_aude(u8_t *pkt, int len) {
+	(void)len;
 	struct aude_packet *aude = (struct aude_packet *)pkt;
 
 	LOG_DEBUG("enable spdif: %d dac: %d", aude->enable_spdif, aude->enable_dac);
@@ -442,6 +445,7 @@ static void process_aude(u8_t *pkt, int len) {
 }
 
 static void process_audg(u8_t *pkt, int len) {
+	(void)len;
 	struct audg_packet *audg = (struct audg_packet *)pkt;
 	audg->gainL = unpackN(&audg->gainL);
 	audg->gainR = unpackN(&audg->gainR);
@@ -464,11 +468,17 @@ static void process_setd(u8_t *pkt, int len) {
 				sendSETDName(player_name);
 			}
 		} else if (len > 5) {
-			strncpy(player_name, setd->data, PLAYER_NAME_LEN);
-			player_name[PLAYER_NAME_LEN] = '\0';
-			LOG_INFO("set name: %s", setd->data);
+			size_t payload = (size_t)len - sizeof(struct setd_packet);
+			size_t name_len = strnlen(setd->data, payload);
+			if (name_len > PLAYER_NAME_LEN) name_len = PLAYER_NAME_LEN;
+			memcpy(player_name, setd->data, name_len);
+			player_name[name_len] = '\0';
+			for (size_t i = 0; i < name_len; ++i) {
+				if ((unsigned char)player_name[i] < 0x20 || player_name[i] == 0x7f) player_name[i] = ' ';
+			}
+			LOG_INFO("set name: %s", player_name);
 			// confirm change to server
-			sendSETDName(setd->data);
+			sendSETDName(player_name);
 			// write name to name_file if -N option set
 			if (name_file) {
 				FILE *fp = fopen(name_file, "w");
@@ -505,6 +515,10 @@ static void process_serv(u8_t *pkt, int len) {
 		if (!new_server_cap) {
 			new_server_cap = malloc(SYNC_CAP_LEN + 10 + 1);
 		}
+		if (!new_server_cap) {
+			LOG_ERROR("unable to allocate server capability");
+			return;
+		}
 		new_server_cap[0] = '\0';
 		strcat(new_server_cap, SYNC_CAP);
 		strncat(new_server_cap, (const char *)(pkt + sizeof(struct serv_packet)), 10);
@@ -519,29 +533,37 @@ static void process_serv(u8_t *pkt, int len) {
 struct handler {
 	char opcode[5];
 	void (*handler)(u8_t *, int);
+	size_t min_len;
 };
 
 static struct handler handlers[] = {
-	{ "strm", process_strm },
-	{ "cont", process_cont },
-	{ "codc", process_codc },
-	{ "aude", process_aude },
-	{ "audg", process_audg },
-	{ "setd", process_setd },
-	{ "serv", process_serv },
-	{ "",     NULL  },
+	{ "strm", process_strm, sizeof(struct strm_packet) },
+	{ "cont", process_cont, sizeof(struct cont_packet) },
+	{ "codc", process_codc, sizeof(struct codc_packet) },
+	{ "aude", process_aude, sizeof(struct aude_packet) },
+	{ "audg", process_audg, sizeof(struct audg_packet) },
+	{ "setd", process_setd, sizeof(struct setd_packet) },
+	{ "serv", process_serv, sizeof(struct serv_packet) },
+	{ "",     NULL, 0 },
 };
 
 static void process(u8_t *pack, int len) {
 	struct handler *h = handlers;
+	if (len < 4) {
+		LOG_WARN("discarding short slimproto packet: %d", len);
+		return;
+	}
 	while (h->handler && strncmp((char *)pack, h->opcode, 4)) { h++; }
 
 	if (h->handler) {
+		if ((size_t)len < h->min_len) {
+			LOG_WARN("discarding short %s packet: %d < %zu", h->opcode, len, h->min_len);
+			return;
+		}
 		LOG_DEBUG("%s", h->opcode);
 		h->handler(pack, len);
 	} else {
-		pack[4] = '\0';
-		LOG_WARN("unhandled %s", (char *)pack);
+		LOG_WARN("unhandled %.4s", (char *)pack);
 	}
 }
 
@@ -595,8 +617,8 @@ static void slimproto_run() {
 					if (got == 2) {
 						expect = buffer[0] << 8 | buffer[1]; // length pack 'n'
 						got = 0;
-						if (expect > MAXBUF) {
-							LOG_ERROR("FATAL: slimproto packet too big: %d > %d", expect, MAXBUF);
+						if (expect < 4 || expect > MAXBUF) {
+							LOG_ERROR("FATAL: invalid slimproto packet length: %d (allowed 4..%d)", expect, MAXBUF);
 							return;
 						}
 					}
@@ -718,15 +740,16 @@ static void slimproto_run() {
 			}
 #endif
 #if COREAUDIO
-			if (output.coreaudio_reopen) {
-				output.coreaudio_reopen = false;
+			if (__atomic_exchange_n(&output.coreaudio_reopen, false, __ATOMIC_ACQ_REL)) {
 				UNLOCK_O;
 				_coreaudio_open();
 				LOCK_O;
 			}
 #endif
 			if (_start_output && (output.state == OUTPUT_STOPPED || output.state == OUTPUT_OFF)) {
+				bool was_off = output.state == OUTPUT_OFF;
 				output.state = OUTPUT_BUFFER;
+				if (was_off) __atomic_store_n(&output.coreaudio_reopen, true, __ATOMIC_RELEASE);
 			}
 			if (output.state == OUTPUT_RUNNING && !sentSTMu && status.output_full == 0 && status.stream_state <= DISCONNECT &&
 				_decode_state == DECODE_STOPPED) {
@@ -798,7 +821,15 @@ in_addr_t discover_server(char *default_server) {
 	int disc_sock = socket(AF_INET, SOCK_DGRAM, 0);
 
 	socklen_t enable = 1;
-	setsockopt(disc_sock, SOL_SOCKET, SO_BROADCAST, (const void *)&enable, sizeof(enable));
+	memset(&s, 0, sizeof(s));
+	if (disc_sock < 0) {
+		LOG_WARN("unable to create LMS discovery socket");
+		if (default_server) server_addr(default_server, &s.sin_addr.s_addr, &port);
+		return s.sin_addr.s_addr;
+	}
+	if (setsockopt(disc_sock, SOL_SOCKET, SO_BROADCAST, (const void *)&enable, sizeof(enable)) < 0) {
+		LOG_WARN("unable to enable LMS discovery broadcast");
+	}
 
 	buf = "e";
 

@@ -130,6 +130,7 @@ extern struct processstate process;
 #endif
 
 static void metadata_cb(const FLAC__StreamDecoder* decoder, const FLAC__StreamMetadata* metadata, void* client_data) {
+	(void)decoder; (void)client_data;
 	switch (metadata->type) {
 	case FLAC__METADATA_TYPE_STREAMINFO:
 		LOG_INFO("stream parameters rate:%d, channels:%d, size:%d", metadata->data.stream_info.sample_rate, 
@@ -149,6 +150,7 @@ static void metadata_cb(const FLAC__StreamDecoder* decoder, const FLAC__StreamMe
 }
 
 static FLAC__StreamDecoderReadStatus read_cb(const FLAC__StreamDecoder *decoder, FLAC__byte buffer[], size_t *want, void *client_data) {
+	(void)decoder; (void)client_data;
 	size_t bytes;
 	bool end;
 
@@ -172,6 +174,7 @@ static FLAC__StreamDecoderReadStatus read_cb(const FLAC__StreamDecoder *decoder,
 
 static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
 											   const FLAC__int32 *const buffer[], void *client_data) {
+	(void)decoder; (void)client_data;
 
 	size_t frames = frame->header.blocksize;
 	unsigned bits_per_sample = frame->header.bits_per_sample;
@@ -269,6 +272,7 @@ static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decode
 }
 
 static void error_cb(const FLAC__StreamDecoder *decoder, FLAC__StreamDecoderErrorStatus status, void *client_data) {
+	(void)decoder; (void)client_data;
 	LOG_INFO("flac error: %s", FLAC_A(f, StreamDecoderErrorStatusString)[status]);
 }
 

@@ -50,8 +50,11 @@ static void test_clipping_and_validation(void) {
 	assert(samples[0] == INT32_MAX && samples[1] == INT32_MIN);
 	assert(telemetry.clipped_samples == 2);
 	assert(!dsp_init("unknown=1"));
+	assert(!dsp_init("limiter=invalid"));
 	assert(dsp_init("peak=30000:0.7:3;headroom=3"));
 	assert(!dsp_newstream(44100));
+	/* A rate-incompatible track must not destroy the queued configuration. */
+	assert(dsp_newstream(96000));
 }
 
 static void test_bypass_null(void) {
@@ -95,6 +98,8 @@ static void test_json_persistence_and_rollback(void) {
 	const char *json1 = "{\"version\":1,\"player_id\":\"test-player\",\"bypass\":false,\"preamp_db\":-1.5,\"headroom_db\":null,\"graphic_eq_db\":[0,0,0,0,0,0,0,0,0,0,0,0],\"parametric\":\"peak=1000:1:-2\"}";
 	const char *json2 = "{\"version\":1,\"player_id\":\"test-player\",\"bypass\":true,\"preamp_db\":0,\"headroom_db\":0,\"graphic_eq_db\":[0,0,0,0,0,0,0,0,0,0,0,0],\"parametric\":\"\"}";
 	const char *json3 = "{\"version\":2,\"player_id\":\"test-player\",\"bypass\":false,\"preamp_db\":0,\"headroom_db\":null,\"graphic_eq_db\":[0,0,0,0,0,0,0,0,0,0,0,0],\"graphic_eq_enabled\":[true,true,true,true,true,true,true,true,true,true,true,true],\"parametric\":\"\",\"fir_file\":\"\",\"fir_normalize\":true}";
+	const char *bad_token = "{\"version\":1junk,\"player_id\":\"test-player\",\"bypass\":false,\"preamp_db\":0,\"headroom_db\":0,\"graphic_eq_db\":[0,0,0,0,0,0,0,0,0,0,0,0],\"parametric\":\"\"}";
+	const char *bad_trailing = "{\"version\":1,\"player_id\":\"test-player\",\"bypass\":false,\"preamp_db\":0,\"headroom_db\":0,\"graphic_eq_db\":[0,0,0,0,0,0,0,0,0,0,0,0],\"parametric\":\"\"} junk";
 	char *options;
 	unlink(path); unlink("/tmp/apple-squeezer-dsp-test.json.bak"); unlink("/tmp/apple-squeezer-dsp-test.json.rejected");
 	assert(dsp_config_save(path, "test-player", json1));
@@ -105,6 +110,8 @@ static void test_json_persistence_and_rollback(void) {
 	options = dsp_config_load_options(path, "test-player"); assert(options && strstr(options, "preamp=-1.5")); free(options);
 	assert(dsp_config_save(path, "test-player", json3));
 	options = dsp_config_load_options(path, "test-player"); assert(options && !strstr(options, "fir=;")); free(options);
+	assert(!dsp_config_save(path, "test-player", bad_token));
+	assert(!dsp_config_save(path, "test-player", bad_trailing));
 	unlink(path); unlink("/tmp/apple-squeezer-dsp-test.json.rejected");
 }
 

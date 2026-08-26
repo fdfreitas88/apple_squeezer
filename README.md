@@ -4,8 +4,10 @@ Apple Squeezer is an Intel macOS build of Squeezelite using Apple's native
 CoreAudio AUHAL output path. The release candidate targets x86_64 Macs running
 macOS 11 or newer and is based on upstream Squeezelite revision 1595.
 
-This is a pre-release test candidate. It is not signed or notarized, and its
-full 176.4/192 kHz and DSD64/DoP physical qualification remains pending.
+This is a pre-release test candidate. It is not signed or notarized. Physical
+Chord Mojo qualification passed at 44.1, 48, 88.2, 96, 176.4, and 192 kHz,
+including native DSD64/DoP at 176.4 kHz. The automated endurance fixture also
+processed audio without underruns, CoreAudio overloads, or clipped samples.
 
 The candidate provides native hardware-rate switching, physical stream-format
 verification, CoreAudio latency compensation and device recovery, exclusive

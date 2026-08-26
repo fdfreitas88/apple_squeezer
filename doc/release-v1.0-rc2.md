@@ -25,9 +25,13 @@ x86_64 macOS 11 or newer.
 - Clean x86_64 macOS 11-targeted build: passed.
 - Native DSP unit suite: passed.
 - FLAC conversion and static-link checks: passed in earlier candidate runs.
-- Physical CoreAudio playback at 44.1, 48, 88.2, and 96 kHz: passed on the Chord Mojo.
-- Latest physical run did not collect fresh 176.4/192 kHz or DSD64/DoP evidence.
-- The latest harness cleanup also reported a player process that did not stop.
+- Physical CoreAudio playback at 44.1, 48, 88.2, 96, 176.4, and 192 kHz:
+  passed on the Chord Mojo with physical-stream readback.
+- Native DSD64/DoP at 176.4 kHz: passed; the CoreAudio signal path reported
+  `S32 DoP -> CoreAudio 176400 Hz` in bit-perfect mode.
+- Automated endurance playback processed millions of frames with zero
+  underruns, CoreAudio overloads, or clipped samples.
+- Automatic failure rollback and standalone LMS plugin restoration: passed.
 - A 24-hour endurance qualification has not been completed.
 
 This release must therefore be treated as a test candidate, not as a stable or

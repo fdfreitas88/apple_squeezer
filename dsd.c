@@ -22,6 +22,7 @@
 // dsd support
 
 #include "squeezelite.h"
+#include <math.h>
 
 #if DSD
 
@@ -73,11 +74,33 @@ struct dsd {
 	u64_t sample_bytes;
 	u32_t block_size;
 	bool  lsb_first;
+	bool  ready;
 	dsd2pcm_ctx *dsd2pcm_ctx[2];
 	float *transfer[2];
 };
 
 static struct dsd *d;
+
+static s32_t _pcm32(float sample) {
+	double scaled = (double)sample * 2147483647.0;
+	if (!isfinite(scaled)) return 0;
+	if (scaled > 2147483647.0) return INT32_MAX;
+	if (scaled < -2147483648.0) return INT32_MIN;
+	return (s32_t)llround(scaled);
+}
+
+static bool _valid_stream_format(void) {
+	if ((d->channels != 1 && d->channels != 2) || !d->sample_rate) {
+		LOG_WARN("unsupported DSD format: rate=%u channels=%u", d->sample_rate, d->channels);
+		return false;
+	}
+	if (d->type == DSF && (!d->block_size || d->block_size > UINT32_MAX / d->channels ||
+		d->block_size > streambuf->size / d->channels)) {
+		LOG_WARN("invalid DSF block size");
+		return false;
+	}
+	return true;
+}
 
 static u64_t unpack64be(const u8_t *p) {
 	return 
@@ -98,7 +121,7 @@ static u32_t unpack32le(const u8_t *p) {
 
 static int _read_header(void) {
 	unsigned bytes = min(_buf_used(streambuf), _buf_cont_read(streambuf));
-	s32_t consume;
+	u64_t consume;
 
 	if (!d->type && bytes >= 4) {
 		if (!memcmp(streambuf->readp, "FRM8", 4)) {
@@ -117,6 +140,10 @@ static int _read_header(void) {
 		memcpy(id, streambuf->readp, 4);
 		id[4] = '\0';
 		consume = 0;
+		if ((d->type == DSDIFF && len > UINT32_MAX - 12U) || (d->type == DSF && (len < 12 || len > UINT32_MAX))) {
+			LOG_WARN("invalid DSD chunk length: " FMT_u64, len);
+			return -1;
+		}
 
 		if (d->type == DSDIFF) {
 			if (!strcmp(id, "FRM8")) {
@@ -141,12 +168,13 @@ static int _read_header(void) {
 			if (!strcmp(id, "CHNL")) {
 				d->channels = unpackn((void *)(streambuf->readp + 12));
 				LOG_INFO("channels: %u", d->channels);
+				if (d->channels != 1 && d->channels != 2) return -1;
 			}
 			if (!strcmp(id, "DSD ")) {
+				if (!_valid_stream_format()) return -1;
 				LOG_INFO("found dsd len: " FMT_u64, len);
 				d->sample_bytes = len;
 				_buf_inc_readp(streambuf, 12);
-				bytes  -= 12;
 				return 1; // got to the audio
 			}
 		}
@@ -171,33 +199,35 @@ static int _read_header(void) {
 					LOG_INFO("lsb first: %u", d->lsb_first);
 					LOG_INFO("sample bytes: " FMT_u64, d->sample_bytes);
 					LOG_INFO("block size: %u", d->block_size);
+					if (!_valid_stream_format()) return -1;
 				} else {
-					consume = -1; // come back later
+					// The complete fixed-size DSF fmt chunk has not arrived yet.
+					// Do not turn the wait sentinel into an unsigned, enormous skip.
+					break;
 				}
 			}
 			if (!strcmp(id, "data")) {
+				if (!_valid_stream_format()) return -1;
 				LOG_INFO("found dsd len: " FMT_u64, len);
 				_buf_inc_readp(streambuf, 12);
-				bytes  -= 12;
 				return 1; // got to the audio
 			}
 		}
 
 		// default to consuming whole chunk
 		if (!consume) {
-			consume = (s32_t)((d->type == DSDIFF) ? len + 12 : len);
+			consume = d->type == DSDIFF ? len + 12U + (len & 1U) : len;
 		}
+		if (!consume || consume > UINT32_MAX) return -1;
 
 		if (bytes >= consume) {
-			LOG_DEBUG("id: %s len: " FMT_u64 " consume: %d", id, len, consume);
-			_buf_inc_readp(streambuf, consume);
-			bytes  -= consume;
-		} else if (consume > 0) {
-			LOG_DEBUG("id: %s len: " FMT_u64 " consume: %d - partial consume: %u", id, len, consume, bytes);
-			_buf_inc_readp(streambuf, bytes);
-			d->consume = consume - bytes;
-			break;
+			LOG_DEBUG("id: %s len: " FMT_u64 " consume: " FMT_u64, id, len, consume);
+			_buf_inc_readp(streambuf, (unsigned)consume);
+			bytes  -= (unsigned)consume;
 		} else {
+			LOG_DEBUG("id: %s len: " FMT_u64 " consume: " FMT_u64 " - partial consume: %u", id, len, consume, bytes);
+			_buf_inc_readp(streambuf, bytes);
+			d->consume = (u32_t)(consume - bytes);
 			break;
 		}
 	}
@@ -230,7 +260,6 @@ static decode_state _decode_dsf(void) {
 	default:
 		bytes_per_frame = 1;
 	}
-	
 	if (bytes < d->block_size * d->channels) {
 		LOG_INFO("stream too short"); // this can occur when scanning the track
 		return DECODE_COMPLETE;
@@ -284,7 +313,7 @@ static decode_state _decode_dsf(void) {
 		if (frames == 0) {
 			if (d->sample_bytes && bytes >= (2 * d->sample_bytes)) {
 				// byte(s) left fill frame with silence byte(s) and play
-				int i;
+				unsigned i;
 				for (i = d->sample_bytes; i < bytes_per_frame; i++)
 					*(iptrl + i) = *(iptrr + i) = 0x69;
 				frames = 1;
@@ -461,11 +490,9 @@ static decode_state _decode_dsf(void) {
 				float *iptrf = d->transfer[0];
 				dsd2pcm_translate(d->dsd2pcm_ctx[0], frames, iptrl, 1, d->lsb_first, iptrf, 1);
 				while (count--) {
-					double scaled = *iptrf++ * 0x7fffffff;
-					if (scaled >  2147483647.0) scaled =  2147483647.0;
-					if (scaled < -2147483648.0) scaled = -2147483648.0;
-					*optr++ = (s32_t)scaled;
-					*optr++ = (s32_t)scaled;
+					s32_t scaled = _pcm32(*iptrf++);
+					*optr++ = scaled;
+					*optr++ = scaled;
 				}
 			} else {
 				float *iptrfl = d->transfer[0];
@@ -473,14 +500,8 @@ static decode_state _decode_dsf(void) {
 				dsd2pcm_translate(d->dsd2pcm_ctx[0], frames, iptrl, 1, d->lsb_first, iptrfl, 1);
 				dsd2pcm_translate(d->dsd2pcm_ctx[1], frames, iptrr, 1, d->lsb_first, iptrfr, 1);
 				while (count--) {
-					double scaledl = *iptrfl++ * 0x7fffffff;
-					double scaledr = *iptrfr++ * 0x7fffffff;
-					if (scaledl >  2147483647.0) scaledl =  2147483647.0;
-					if (scaledl < -2147483648.0) scaledl = -2147483648.0;
-					if (scaledr >  2147483647.0) scaledr =  2147483647.0;
-					if (scaledr < -2147483648.0) scaledr = -2147483648.0;
-					*optr++ = (s32_t)scaledl;
-					*optr++ = (s32_t)scaledr;
+					*optr++ = _pcm32(*iptrfl++);
+					*optr++ = _pcm32(*iptrfr++);
 				}
 			}
 			
@@ -559,9 +580,13 @@ static decode_state _decode_dsdiff(void) {
 	case DOP_S24_3LE:
 		bytes_per_frame = d->channels * 2;
 		break;
-	default:
-		bytes_per_frame = d->channels;
-		out = min(out, BLOCK);
+		default:
+			bytes_per_frame = d->channels;
+			out = min(out, BLOCK);
+		}
+	if (!bytes_per_frame || bytes_per_frame > sizeof(tmp)) {
+		LOG_ERROR("invalid DSD frame size: %u", bytes_per_frame);
+		return DECODE_ERROR;
 	}
 	
 	frames = min(min(bytes, d->sample_bytes) / bytes_per_frame, out);
@@ -580,7 +605,7 @@ static decode_state _decode_dsdiff(void) {
 	if (!frames && bytes < bytes_per_frame) {
 		memset(tmp, 0x69, WRAP_BUF_SIZE); // 0x69 = dsd silence
 		memcpy(tmp, streambuf->readp, bytes);
-		if (_buf_used(streambuf) > bytes_per_frame) {
+		if (_buf_used(streambuf) >= bytes_per_frame) {
 			memcpy(tmp + bytes, streambuf->buf, bytes_per_frame - bytes);
 			bytes_read = bytes_per_frame;
 		} else {
@@ -678,11 +703,9 @@ static decode_state _decode_dsdiff(void) {
 			float *iptrf = d->transfer[0];
 			dsd2pcm_translate(d->dsd2pcm_ctx[0], frames, iptr, 1, 0, iptrf, 1);
 			while (count--) {
-				double scaled = *iptrf++ * 0x7fffffff;
-				if (scaled >  2147483647.0) scaled =  2147483647.0;
-				if (scaled < -2147483648.0) scaled = -2147483648.0;
-				*optr++ = (s32_t)scaled;
-				*optr++ = (s32_t)scaled;
+				s32_t scaled = _pcm32(*iptrf++);
+				*optr++ = scaled;
+				*optr++ = scaled;
 			}
 		} else {
 			float *iptrfl = d->transfer[0];
@@ -690,14 +713,8 @@ static decode_state _decode_dsdiff(void) {
 			dsd2pcm_translate(d->dsd2pcm_ctx[0], frames, iptr,     d->channels, 0, iptrfl, 1);
 			dsd2pcm_translate(d->dsd2pcm_ctx[1], frames, iptr + 1, d->channels, 0, iptrfr, 1);
 			while (count--) {
-				double scaledl = *iptrfl++ * 0x7fffffff;
-				double scaledr = *iptrfr++ * 0x7fffffff;
-				if (scaledl >  2147483647.0) scaledl =  2147483647.0;
-				if (scaledl < -2147483648.0) scaledl = -2147483648.0;
-				if (scaledr >  2147483647.0) scaledr =  2147483647.0;
-				if (scaledr < -2147483648.0) scaledr = -2147483648.0;
-				*optr++ = (s32_t)scaledl;
-				*optr++ = (s32_t)scaledr;
+				*optr++ = _pcm32(*iptrfl++);
+				*optr++ = _pcm32(*iptrfr++);
 			}
 		}
 
@@ -730,6 +747,7 @@ static decode_state _decode_dsdiff(void) {
 static decode_state dsd_decode(void) {
 	decode_state ret;
 	char *fmtstr;
+	if (!d->ready) return DECODE_ERROR;
 
 	fmtstr = "None";
 
@@ -753,7 +771,7 @@ static decode_state dsd_decode(void) {
 
 	if (decode.new_stream) {
 		int r = _read_header();
-		if (r < 1) {
+		if (r < 0) {
 			UNLOCK_S;
 			return DECODE_ERROR;
 		}
@@ -855,34 +873,40 @@ void dsd_init(dsd_format format, unsigned delay) {
 }
 
 static void dsd_open(u8_t size, u8_t rate, u8_t chan, u8_t endianness) {
+	(void)size; (void)rate; (void)chan; (void)endianness;
 	d->type = UNKNOWN;
+	d->consume = d->sample_rate = d->channels = d->block_size = 0;
+	d->sample_bytes = 0;
+	d->lsb_first = false;
+	d->ready = false;
 
-	if (!d->dsd2pcm_ctx[0]) {
+	if (!d->dsd2pcm_ctx[0] || !d->dsd2pcm_ctx[1]) {
+		if (d->dsd2pcm_ctx[0]) dsd2pcm_destroy(d->dsd2pcm_ctx[0]);
+		if (d->dsd2pcm_ctx[1]) dsd2pcm_destroy(d->dsd2pcm_ctx[1]);
 		d->dsd2pcm_ctx[0] = dsd2pcm_init();
 		d->dsd2pcm_ctx[1] = dsd2pcm_init();
 	} else {
 		dsd2pcm_reset(d->dsd2pcm_ctx[0]);
 		dsd2pcm_reset(d->dsd2pcm_ctx[1]);
 	}
-	if (!d->transfer[1]) {
+	if (!d->transfer[0] || !d->transfer[1]) {
+		free(d->transfer[0]);
+		free(d->transfer[1]);
 		d->transfer[0] = malloc(sizeof(float) * BLOCK);
 		d->transfer[1] = malloc(sizeof(float) * BLOCK);
 	}
+	d->ready = d->dsd2pcm_ctx[0] && d->dsd2pcm_ctx[1] && d->transfer[0] && d->transfer[1];
+	if (!d->ready) LOG_ERROR("unable to allocate DSD decoder state");
 }
 
 static void dsd_close(void) {
-	if (d->dsd2pcm_ctx[0]) {
-		dsd2pcm_destroy(d->dsd2pcm_ctx[0]);
-		dsd2pcm_destroy(d->dsd2pcm_ctx[1]);
-		d->dsd2pcm_ctx[0] = NULL;
-		d->dsd2pcm_ctx[1] = NULL;
-	}
-	if (d->transfer[0]) {
-		free(d->transfer[0]);
-		free(d->transfer[1]);
-		d->transfer[0] = NULL;
-		d->transfer[1] = NULL;
-	}
+	if (d->dsd2pcm_ctx[0]) dsd2pcm_destroy(d->dsd2pcm_ctx[0]);
+	if (d->dsd2pcm_ctx[1]) dsd2pcm_destroy(d->dsd2pcm_ctx[1]);
+	d->dsd2pcm_ctx[0] = d->dsd2pcm_ctx[1] = NULL;
+	free(d->transfer[0]);
+	free(d->transfer[1]);
+	d->transfer[0] = d->transfer[1] = NULL;
+	d->ready = false;
 }
 
 struct codec *register_dsd(void) {

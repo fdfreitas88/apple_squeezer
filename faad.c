@@ -259,23 +259,29 @@ static int read_mp4_header(unsigned long *samplerate_p, unsigned char *channels_
 		}
 
 		// parse key-value atoms within ilst ---- entries to get encoder padding within iTunSMPB entry for gapless
-		if (!strcmp(type, "----") && bytes > len) {
+		if (!strcmp(type, "----") && len >= 8 && bytes >= len) {
 			u8_t *ptr = streambuf->readp + 8;
 			u32_t remain = len - 8, size;
-			if (!memcmp(ptr + 4, "mean", 4) && (size = unpackN((u32_t *)ptr)) < remain) {
+			if (remain >= 8 && !memcmp(ptr + 4, "mean", 4) && (size = unpackN((u32_t *)ptr)) >= 8 && size <= remain) {
 				ptr += size; remain -= size;
 			}
-			if (!memcmp(ptr + 4, "name", 4) && (size = unpackN((u32_t *)ptr)) < remain && !memcmp(ptr + 12, "iTunSMPB", 8)) {
+			if (remain >= 20 && !memcmp(ptr + 4, "name", 4) && (size = unpackN((u32_t *)ptr)) >= 20 && size <= remain && !memcmp(ptr + 12, "iTunSMPB", 8)) {
 				ptr += size; remain -= size;
 			}
-			if (!memcmp(ptr + 4, "data", 4) && remain > 16 + 48) {
+			if (remain > 16 + 48 && !memcmp(ptr + 4, "data", 4) &&
+				(size = unpackN((u32_t *)ptr)) >= 16 && size <= remain) {
 				// data is stored as hex strings: 0 start end samples
 				u32_t b, c; u64_t d;
-				if (sscanf((const char *)(ptr + 16), "%x %x %x " FMT_x64, &b, &b, &c, &d) == 4) {
+				char text[129];
+				size_t text_len = min((size_t)size - 16, sizeof(text) - 1);
+				memcpy(text, ptr + 16, text_len);
+				text[text_len] = '\0';
+				if (sscanf(text, "%x %x %x " FMT_x64, &b, &b, &c, &d) == 4) {
 					LOG_DEBUG("iTunSMPB start: %u end: %u samples: " FMT_u64, b, c, d);
-					if (a->sttssamples && a->sttssamples < b + c + d) {
+					if (a->sttssamples && (d > a->sttssamples ||
+						(u64_t)b + c > a->sttssamples - d)) {
 						LOG_DEBUG("reducing samples as stts count is less");
-						d = a->sttssamples - (b + c);
+						d = (u64_t)b + c < a->sttssamples ? a->sttssamples - ((u64_t)b + c) : 0;
 					}
 					a->skip = b;
 					a->samples = d;
@@ -472,6 +478,10 @@ static decode_state faad_decode(void) {
 		return DECODE_RUNNING;
 	}
 
+	if (info.channels != 1 && info.channels != 2) {
+		LOG_WARN("unsupported AAC channel count: %u", info.channels);
+		return DECODE_ERROR;
+	}
 	frames = info.samples / info.channels;
 
 	if (a->skip) {

@@ -73,6 +73,7 @@ static struct soxr *r;
 void resample_samples(struct processstate *process) {
 	size_t idone, odone;
 	size_t clip_cnt;
+	process->out_frames = 0;
 	
 	soxr_error_t error =
 		SOXR(r, process, r->resampler, process->inbuf, process->in_frames, &idone, process->outbuf, process->max_out_frames, &odone);
@@ -102,6 +103,7 @@ void resample_samples(struct processstate *process) {
 bool resample_drain(struct processstate *process) {
 	size_t odone;
 	size_t clip_cnt;
+	process->out_frames = 0;
 		
 	soxr_error_t error = SOXR(r, process, r->resampler, NULL, 0, NULL, process->outbuf, process->max_out_frames, &odone);
 	if (error) {
@@ -136,6 +138,11 @@ bool resample_drain(struct processstate *process) {
 bool resample_newstream(struct processstate *process, unsigned raw_sample_rate, unsigned supported_rates[]) {
 	unsigned outrate = 0;
 	int i;
+
+	if (!raw_sample_rate || !supported_rates || !supported_rates[0]) {
+		LOG_ERROR("invalid resampler rates: input=%u", raw_sample_rate);
+		return false;
+	}
 
 	if (r->target_rate) {
 		for (i = 0; supported_rates[i]; i++) {

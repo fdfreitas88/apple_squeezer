@@ -321,6 +321,7 @@ static void sighandler(int signum) {
 }
 
 int main(int argc, char **argv) {
+	if (argc < 1 || !argv || !argv[0]) return 1;
 	char *server = NULL;
 	char *output_device = "default";
 	char *include_codecs = NULL;
@@ -434,6 +435,7 @@ int main(int argc, char **argv) {
 
 		switch (opt[0]) {
 		case 'o':
+			if (!optarg) { usage(argv[0]); return 1; }
 			output_device = optarg;
 #if ALSA
 			mixer_device = optarg;
@@ -511,13 +513,13 @@ int main(int argc, char **argv) {
 					char *r = next_param(rstr, ',');
 					unsigned tmp[MAX_SUPPORTED_SAMPLERATES] = { 0 };
 					int i, j;
-					int last = 999999;
+					unsigned last = UINT_MAX;
 					for (i = 0; r && i < MAX_SUPPORTED_SAMPLERATES; ++i) { 
 						tmp[i] = atoi(r);
 						r = next_param(NULL, ',');
 					}
 					for (i = 0; i < MAX_SUPPORTED_SAMPLERATES; ++i) {
-						int largest = 0;
+						unsigned largest = 0;
 						for (j = 0; j < MAX_SUPPORTED_SAMPLERATES; ++j) {
 							if (tmp[j] > largest && tmp[j] < last) {
 								largest = tmp[j];
@@ -893,6 +895,9 @@ int main(int argc, char **argv) {
 	slimproto(log_slimproto, server, mac, name, namefile, modelname, maxSampleRate);
 
 	decode_close();
+#if DSP
+	dsp_close();
+#endif
 	stream_close();
 
 	if (!strcmp(output_device, "-")) {

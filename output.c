@@ -38,6 +38,20 @@ u8_t *silencebuf_dsd;
 
 bool user_rates = false;
 
+#if COREAUDIO
+/* Never enter stdio from CoreAudio's time-constrained render callback. */
+#undef LOG_ERROR
+#undef LOG_WARN
+#undef LOG_INFO
+#undef LOG_DEBUG
+#undef LOG_SDEBUG
+#define LOG_ERROR(fmt, ...) if (!coreaudio_rendering()) logprint("%s %s:%d " fmt "\n", logtime(), __FUNCTION__, __LINE__, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  if (!coreaudio_rendering() && loglevel >= lWARN)  logprint("%s %s:%d " fmt "\n", logtime(), __FUNCTION__, __LINE__, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  if (!coreaudio_rendering() && loglevel >= lINFO)  logprint("%s %s:%d " fmt "\n", logtime(), __FUNCTION__, __LINE__, ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...) if (!coreaudio_rendering() && loglevel >= lDEBUG) logprint("%s %s:%d " fmt "\n", logtime(), __FUNCTION__, __LINE__, ##__VA_ARGS__)
+#define LOG_SDEBUG(fmt, ...) if (!coreaudio_rendering() && loglevel >= lSDEBUG) logprint("%s %s:%d " fmt "\n", logtime(), __FUNCTION__, __LINE__, ##__VA_ARGS__)
+#endif
+
 #define LOCK   mutex_lock(outputbuf->mutex)
 #define UNLOCK mutex_unlock(outputbuf->mutex)
 
@@ -68,7 +82,11 @@ frames_t _output_frames(frames_t avail) {
 	if (output.state == OUTPUT_BUFFER && frames > output.threshold * output.next_sample_rate / 10 && frames > output.start_frames) {
 		output.state = OUTPUT_RUNNING;
 		LOG_INFO("start buffer frames: %u", frames);
+#if COREAUDIO
+		coreaudio_defer_wake();
+#else
 		wake_controller();
+#endif
 	}
 	
 	// skip ahead - consume outputbuf but play nothing
@@ -221,7 +239,7 @@ frames_t _output_frames(frames_t avail) {
 					}
 				}
 				// if fade in progress set fade gain, ensure cont_frames reduced so we get to end of fade at start of chunk
-				if (output.fade) {
+					if (output.fade && dur_f) {
 					if (output.fade_end > outputbuf->readp) {
 						cont_frames = min(cont_frames, (output.fade_end - outputbuf->readp) / BYTES_PER_FRAME);
 					}
@@ -302,6 +320,10 @@ void _checkfade(bool start) {
 	if (output.fade_mode == FADE_INOUT) {
 		/* align on a frame boundary */
 		bytes = ((bytes / 2) / BYTES_PER_FRAME) * BYTES_PER_FRAME;
+	}
+	if (!bytes) {
+		output.fade = FADE_INACTIVE;
+		return;
 	}
 
 	if (start && (output.fade_mode == FADE_IN || (output.fade_mode == FADE_INOUT && _buf_used(outputbuf) == 0))) {
@@ -451,7 +473,7 @@ void output_flush(void) {
 	if (output.state != OUTPUT_OFF) {
 		output.state = OUTPUT_STOPPED;
 		output.stop_time = gettime_ms();
-		if (output.error_opening) {
+		if (__atomic_load_n(&output.error_opening, __ATOMIC_ACQUIRE)) {
 			output.current_sample_rate = output.default_sample_rate;
 		}
 		output.delay_active = false;

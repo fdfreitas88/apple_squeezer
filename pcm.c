@@ -20,13 +20,12 @@
  */
 
 #include "squeezelite.h"
+#include "pcm_convert.h"
 
 #if BYTES_PER_FRAME == 4
-#define SHIFT 16
 #define OPTR_T	u16_t
 #else
 #define OPTR_T	u32_t	
-#define SHIFT 0
 #endif
 
 extern log_level loglevel;
@@ -71,27 +70,47 @@ static u32_t sample_size;
 static u32_t channels;
 static bool  bigendian;
 static bool  limit;
+static bool  format_error;
+static bool  unsigned_8bit;
 static u32_t audio_left;
 static u32_t bytes_per_frame;
 
+static u32_t _read_sample(const u8_t *p) {
+	return pcm_read_s32(p, sample_size, bigendian, unsigned_8bit);
+}
+
+static OPTR_T _pack_sample(const u8_t *p) {
+	u32_t sample = _read_sample(p);
+#if BYTES_PER_FRAME == 4
+	return (OPTR_T)(sample >> 16);
+#else
+	return (OPTR_T)sample;
+#endif
+}
+
 typedef enum { UNKNOWN = 0, WAVE, AIFF } header_format;
 
-static void _check_header(void) {
+static bool _check_header(void) {
 	u8_t *ptr = streambuf->readp;
 	unsigned bytes = min(_buf_used(streambuf), _buf_cont_read(streambuf));
 	header_format format = UNKNOWN;
+	bool have_format = false;
+	bool aifc = false;
 
 	// simple parsing of wav and aiff headers and get to samples
 
-	if (bytes > 12) {
+	if (bytes >= 12) {
 		if (!memcmp(ptr, "RIFF", 4) && !memcmp(ptr+8, "WAVE", 4)) {
 			LOG_INFO("WAVE");
 			format = WAVE;
 		} else if (!memcmp(ptr, "FORM", 4) && (!memcmp(ptr+8, "AIFF", 4) || !memcmp(ptr+8, "AIFC", 4))) {
 			LOG_INFO("AIFF");
 			format = AIFF;
+			aifc = !memcmp(ptr+8, "AIFC", 4);
 		}
 	}
+	if (format == UNKNOWN && bytes < 12 && bytes >= 4 &&
+		(!memcmp(ptr, "RIFF", 4) || !memcmp(ptr, "FORM", 4))) return false;
 
 	if (format != UNKNOWN) {
 		ptr   += 12;
@@ -99,7 +118,8 @@ static void _check_header(void) {
 
 		while (bytes >= 8) {
 			char id[5];
-			unsigned len;
+				u32_t len;
+				size_t advance;
 			memcpy(id, ptr, 4);
 			id[4] = '\0';
 			
@@ -112,6 +132,11 @@ static void _check_header(void) {
 			LOG_INFO("header: %s len: %d", id, len);
 
 			if (format == WAVE && !memcmp(ptr, "data", 4)) {
+				if (!have_format) {
+					LOG_WARN("WAV data chunk precedes a valid fmt chunk");
+					format_error = true;
+					return true;
+				}
 				ptr += 8;
 				_buf_inc_readp(streambuf, ptr - streambuf->readp);
 				audio_left = len;
@@ -123,14 +148,28 @@ static void _check_header(void) {
 					LOG_INFO("wav audio size: %u", audio_left);
 					limit = true;
 				}
-				return;
+				return true;
 			}
 
-			if (format == AIFF && !memcmp(ptr, "SSND", 4) && bytes >= 16) {
-				unsigned offset = *(ptr+8) << 24 | *(ptr+9) << 16 | *(ptr+10) << 8 | *(ptr+11);
-				// following 4 bytes is blocksize - ignored
-				ptr += 8 + 8;
-				_buf_inc_readp(streambuf, ptr + offset - streambuf->readp);
+				if (format == AIFF && !memcmp(ptr, "SSND", 4) && bytes >= 16) {
+					if (!have_format) {
+						LOG_WARN("AIFF SSND chunk precedes a valid COMM chunk");
+						format_error = true;
+						return true;
+					}
+					unsigned offset = *(ptr+8) << 24 | *(ptr+9) << 16 | *(ptr+10) << 8 | *(ptr+11);
+					// following 4 bytes is blocksize - ignored
+					if (len < 8 || offset > len - 8U || (size_t)offset + 16U > bytes) {
+						LOG_WARN("invalid AIFF SSND offset: %u", offset);
+						format_error = true;
+						return true;
+					}
+					advance = (size_t)(ptr - streambuf->readp) + 16U + offset;
+					if (advance > _buf_used(streambuf)) {
+						format_error = true;
+						return true;
+					}
+					_buf_inc_readp(streambuf, (unsigned)advance);
 				
 				// Reading from an upsampled stream, length could be wrong.
 				// Only use length in header for files.
@@ -139,44 +178,85 @@ static void _check_header(void) {
 					LOG_INFO("aif audio size: %u", audio_left);
 					limit = true;
 				}
-				return;
+				return true;
 			}
 
-			if (format == WAVE && !memcmp(ptr, "fmt ", 4) && bytes >= 24) {
-				// override the server parsed values with our own
-				channels    = *(ptr+10) | *(ptr+11) << 8;
-				sample_rate = *(ptr+12) | *(ptr+13) << 8 | *(ptr+14) << 16 | *(ptr+15) << 24;
-				sample_size = (*(ptr+22) | *(ptr+23) << 8) / 8;
-				bigendian   = 0;
+				if (format == WAVE && !memcmp(ptr, "fmt ", 4) && len >= 16 && bytes >= 24) {
+					u32_t new_channels = *(ptr+10) | *(ptr+11) << 8;
+					u32_t new_rate = *(ptr+12) | *(ptr+13) << 8 | *(ptr+14) << 16 | *(ptr+15) << 24;
+					u32_t bits = *(ptr+22) | *(ptr+23) << 8;
+					u32_t encoding = *(ptr+8) | *(ptr+9) << 8;
+					if (encoding != 1 || (new_channels != 1 && new_channels != 2) || !new_rate ||
+						bits < 8 || bits > 32 || bits % 8) {
+						LOG_WARN("unsupported WAV format: encoding=%u bits=%u rate=%u channels=%u", encoding, bits, new_rate, new_channels);
+						format_error = true;
+						return true;
+					}
+					// override the server parsed values with our own
+					channels    = new_channels;
+					sample_rate = new_rate;
+					sample_size = bits / 8;
+					bigendian   = 0;
+					unsigned_8bit = bits == 8;
+					bytes_per_frame = channels * sample_size;
+					have_format = true;
 				LOG_INFO("pcm size: %u rate: %u chan: %u bigendian: %u", sample_size, sample_rate, channels, bigendian);
 			}
 
-			if (format == AIFF && !memcmp(ptr, "COMM", 4) && bytes >= 26) {
-				int exponent;
+				if (format == AIFF && !memcmp(ptr, "COMM", 4) && bytes >= 26) {
+					int exponent;
+					u32_t new_channels = *(ptr+8) << 8 | *(ptr+9);
+					u32_t bits = *(ptr+14) << 8 | *(ptr+15);
+					bool new_bigendian = true;
+					if (aifc) {
+						if (len < 22) { format_error = true; return true; }
+						if (bytes < 30) return false;
+						if (!memcmp(ptr+26, "sowt", 4)) new_bigendian = false;
+						else if (memcmp(ptr+26, "NONE", 4) && memcmp(ptr+26, "twos", 4)) {
+							LOG_WARN("unsupported AIFC compression type");
+							format_error = true;
+							return true;
+						}
+					}
 				// override the server parsed values with our own
-				channels    = *(ptr+8) << 8 | *(ptr+9);
-				sample_size = (*(ptr+14) << 8 | *(ptr+15)) / 8;
-				bigendian   = 1;
+					channels    = new_channels;
+					sample_size = bits / 8;
+				bigendian   = new_bigendian;
+				unsigned_8bit = false;
 				// sample rate is encoded as IEEE 80 bit extended format
 				// make some assumptions to simplify processing - only use first 32 bits of mantissa
-				exponent = ((*(ptr+16) & 0x7f) << 8 | *(ptr+17)) - 16383 - 31;
+					exponent = ((*(ptr+16) & 0x7f) << 8 | *(ptr+17)) - 16383 - 31;
+					if ((new_channels != 1 && new_channels != 2) || bits < 8 || bits > 32 || bits % 8 || exponent < -31 || exponent > 31) {
+						LOG_WARN("unsupported AIFF format");
+						format_error = true;
+						return true;
+					}
 				sample_rate  = *(ptr+18) << 24 | *(ptr+19) << 16 | *(ptr+20) << 8 | *(ptr+21);
 				while (exponent < 0) { sample_rate >>= 1; ++exponent; }
-				while (exponent > 0) { sample_rate <<= 1; --exponent; }
+					while (exponent > 0) { sample_rate <<= 1; --exponent; }
+					if (!sample_rate) {
+						format_error = true;
+						return true;
+					}
+					bytes_per_frame = channels * sample_size;
+					have_format = true;
 				LOG_INFO("pcm size: %u rate: %u chan: %u bigendian: %u", sample_size, sample_rate, channels, bigendian);
 			}
 
-			if (bytes >= len + 8) {
-				ptr   += len + 8;
-				bytes -= (len + 8);
+				advance = 8U + (size_t)len + (len & 1U);
+				if (advance >= 8U && advance <= bytes) {
+					ptr   += advance;
+					bytes -= advance;
 			} else {
 				LOG_WARN("run out of data");
-				return;
+				return false;
 			}
 		}
+		return false;
 
 	} else {
 		LOG_WARN("unknown format - can't parse header");
+		return true;
 	}
 }
 
@@ -190,7 +270,16 @@ static decode_state pcm_decode(void) {
 	LOCK_S;
 
 	if ( decode.new_stream && ( ( stream.state == STREAMING_FILE ) || pcm_check_header ) ) {
-		_check_header();
+		if (!_check_header()) {
+			UNLOCK_S;
+			return stream.state <= DISCONNECT ? DECODE_ERROR : DECODE_RUNNING;
+		}
+	}
+	if (format_error || !sample_rate || (channels != 1 && channels != 2) || sample_size < 1 || sample_size > 4 ||
+		!bytes_per_frame || bytes_per_frame > sizeof(tmp)) {
+		UNLOCK_S;
+		LOG_ERROR("invalid PCM stream format");
+		return DECODE_ERROR;
 	}
 
 	LOCK_O_direct;
@@ -273,147 +362,17 @@ static decode_state pcm_decode(void) {
 	count = frames * channels;
 
 	if (channels == 2) {
-		if (sample_size == 1) {
-			while (count--) {
-				*optr++ = *iptr++ << (24-SHIFT);
-			}
-		} else if (sample_size == 2) {
-			if (bigendian) {
-#if BYTES_PER_FRAME == 4 && !SL_LITTLE_ENDIAN			
-				// while loop below works as is, but memcpy is a win for that 16/16 typical case
-				memcpy(optr, iptr, count * BYTES_PER_FRAME / 2);
-#else				
-				while (count--) {
-					*optr++ = *(iptr) << (24-SHIFT) | *(iptr+1) << (16-SHIFT);
-					iptr += 2;
-				}
-#endif				
-			} else {
-#if BYTES_PER_FRAME == 4 && SL_LITTLE_ENDIAN			
-				// while loop below works as is, but memcpy is a win for that 16/16 typical case
-				memcpy(optr, iptr, count * BYTES_PER_FRAME / 2);
-#else
-				while (count--) {
-					*optr++ = *(iptr) << (16-SHIFT) | *(iptr+1) << (24-SHIFT);
-					iptr += 2;
-				}
-#endif	
-			}
-		} else if (sample_size == 3) {
-			if (bigendian) {
-				while (count--) {
-#if BYTES_PER_FRAME == 4				
-					*optr++ = *(iptr) << 8 | *(iptr+1);
-#else					
-					*optr++ = *(iptr) << 24 | *(iptr+1) << 16 | *(iptr+2) << 8;
-#endif	
-					iptr += 3;
-				}
-			} else {
-				while (count--) {
-#if BYTES_PER_FRAME == 4									
-					*optr++ = *(iptr+1) | *(iptr+2) << 8;
-#else
-					*optr++ = *(iptr) << 8 | *(iptr+1) << 16 | *(iptr+2) << 24;
-#endif	
-					iptr += 3;
-				}
-			}
-		} else if (sample_size == 4) {
-			if (bigendian) {
-				while (count--) {
-#if BYTES_PER_FRAME == 4														
-					*optr++ = *(iptr) << 8 | *(iptr+1);
-#else
-					*optr++ = *(iptr) << 24 | *(iptr+1) << 16 | *(iptr+2) << 8 | *(iptr+3);
-#endif	
-					iptr += 4;
-				}
-			} else {
-				while (count--) {
-#if BYTES_PER_FRAME == 4																			
-					*optr++ = *(iptr+2) | *(iptr+3) << 8;
-#else
-					*optr++ = *(iptr) | *(iptr+1) << 8 | *(iptr+2) << 16 | *(iptr+3) << 24;
-#endif	
-					iptr += 4;
-				}
-			}
-		}
-	} else if (channels == 1) {
-		if (sample_size == 1) {
-			while (count--) {
-				*optr = *iptr++ << (24-SHIFT);
-				*(optr+1) = *optr;
-				optr += 2;
-			}
-		} else if (sample_size == 2) {
-			if (bigendian) {
-				while (count--) {
-					*optr = *(iptr) << (24-SHIFT) | *(iptr+1) << (16-SHIFT);
-					*(optr+1) = *optr;
-					iptr += 2;
-					optr += 2;
-				}
-			} else {
-				while (count--) {
-					*optr = *(iptr) << (16-SHIFT) | *(iptr+1) << (24-SHIFT);
-					*(optr+1) = *optr;
-					iptr += 2;
-					optr += 2;
-				}
-			}
-		} else if (sample_size == 3) {
-			if (bigendian) {
-				while (count--) {
-#if BYTES_PER_FRAME == 4				
-					*optr++ = *(iptr) << 8 | *(iptr+1);
-#else					
-					*optr = *(iptr) << 24 | *(iptr+1) << 16 | *(iptr+2) << 8;
-#endif				
-					*(optr+1) = *optr;
-					iptr += 3;
-					optr += 2;
-				}
-			} else {
-				while (count--) {
-#if BYTES_PER_FRAME == 4														
-					*optr++ = *(iptr+1) | *(iptr+2) << 8;
-#else					
-					*optr = *(iptr) << 8 | *(iptr+1) << 16 | *(iptr+2) << 24;
-#endif				
-					*(optr+1) = *optr;
-					iptr += 3;
-					optr += 2;
-				}
-			}
-		} else if (sample_size == 4) {
-			if (bigendian) {
-				while (count--) {
-#if BYTES_PER_FRAME == 4														
-					*optr++ = *(iptr) << 8 | *(iptr+1);
-#else					
-					*optr++ = *(iptr) << 24 | *(iptr+1) << 16 | *(iptr+2) << 8 | *(iptr+3);
-#endif				
-					*(optr+1) = *optr;
-					iptr += 4;
-					optr += 2;
-				}
-			} else {
-				while (count--) {
-#if BYTES_PER_FRAME == 4																			
-					*optr++ = *(iptr+2) | *(iptr+3) << 8;
-#else					
-					*optr++ = *(iptr) | *(iptr+1) << 8 | *(iptr+2) << 16 | *(iptr+3) << 24;
-#endif				
-					*(optr+1) = *optr;
-					iptr += 4;
-					optr += 2;
-				}
-			}
+		while (count--) {
+			*optr++ = _pack_sample(iptr);
+			iptr += sample_size;
 		}
 	} else {
-		LOG_ERROR("unsupported channels");
+		while (count--) {
+			OPTR_T sample = _pack_sample(iptr);
+			*optr++ = sample;
+			*optr++ = sample;
+			iptr += sample_size;
+		}
 	}
 
 	LOG_SDEBUG("decoded %u frames", frames);
@@ -438,14 +397,19 @@ static decode_state pcm_decode(void) {
 }
 
 static void pcm_open(u8_t size, u8_t rate, u8_t chan, u8_t endianness) {
-	sample_size = size - '0' + 1;
-	sample_rate = sample_rates[rate - '0'];
-	channels    = chan - '0';
-	bigendian   = (endianness == '0');
+	size_t rate_index = rate >= '0' ? (size_t)(rate - '0') : SIZE_MAX;
+	format_error = size < '0' || size > '3' || rate_index >= sizeof(sample_rates) / sizeof(sample_rates[0]) ||
+		!sample_rates[rate_index] || (chan != '1' && chan != '2') || (endianness != '0' && endianness != '1');
+	sample_size = format_error ? 0 : size - '0' + 1;
+	sample_rate = format_error ? 0 : sample_rates[rate_index];
+	channels    = format_error ? 0 : chan - '0';
+	bigendian   = !format_error && endianness == '0';
+	unsigned_8bit = false;
 	limit       = false;
+	bytes_per_frame = sample_size * channels;
 
 	LOG_INFO("pcm size: %u rate: %u chan: %u bigendian: %u", sample_size, sample_rate, channels, bigendian);
-	buf_adjust(streambuf, sample_size * channels);
+	if (!format_error) buf_adjust(streambuf, bytes_per_frame);
 }
 
 static void pcm_close(void) {

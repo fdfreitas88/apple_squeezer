@@ -59,18 +59,23 @@ bool dsp_ir_load(const char *path, double **left, double **right, unsigned *taps
 	little = !memcmp(data, "RIFF", 4) && !memcmp(data + 8, "WAVE", 4);
 	if (little) {
 		for (offset = 12; offset + 8 <= (size_t)length;) {
-			size_t size = _le32(data + offset + 4), body = offset + 8; if (body + size > (size_t)length) break;
+			size_t size = _le32(data + offset + 4), body = offset + 8; if (size > (size_t)length - body) break;
 			if (!memcmp(data + offset, "fmt ", 4) && size >= 16) { format = _le16(data + body); channels = _le16(data + body + 2); rate = _le32(data + body + 4); bits = _le16(data + body + 14); }
 			if (!memcmp(data + offset, "data", 4)) { data_offset = body; data_size = size; }
+			if (size + (size & 1) > (size_t)length - body) break;
 			offset = body + size + (size & 1);
 		}
 		floating = format == 3;
 		if (format != 1 && format != 3) { _error(error, error_capacity, "WAV impulse must be PCM or IEEE float"); goto fail; }
 	} else if (!memcmp(data, "FORM", 4) && (!memcmp(data + 8, "AIFF", 4) || !memcmp(data + 8, "AIFC", 4))) {
 		for (offset = 12; offset + 8 <= (size_t)length;) {
-			size_t size = _be32(data + offset + 4), body = offset + 8; if (body + size > (size_t)length) break;
-			if (!memcmp(data + offset, "COMM", 4) && size >= 18) { channels = _be16(data + body); bits = _be16(data + body + 6); rate = (unsigned)llround(_extended80(data + body + 8)); format = 1; }
-			if (!memcmp(data + offset, "SSND", 4) && size >= 8) { unsigned skip = _be32(data + body); data_offset = body + 8 + skip; data_size = size - 8 - skip; }
+			size_t size = _be32(data + offset + 4), body = offset + 8; if (size > (size_t)length - body) break;
+			if (!memcmp(data + offset, "COMM", 4) && size >= 18) { channels = _be16(data + body); bits = _be16(data + body + 6); rate = (unsigned)llround(_extended80(data + body + 8)); }
+			if (!memcmp(data + offset, "SSND", 4) && size >= 8) {
+				unsigned skip = _be32(data + body);
+				if ((size_t)skip <= size - 8) { data_offset = body + 8 + skip; data_size = size - 8 - skip; }
+			}
+			if (size + (size & 1) > (size_t)length - body) break;
 			offset = body + size + (size & 1);
 		}
 		little = false;
@@ -88,6 +93,7 @@ bool dsp_ir_load(const char *path, double **left, double **right, unsigned *taps
 		if (fabs(l[i]) > peak) peak = fabs(l[i]); if (fabs(r[i]) > peak) peak = fabs(r[i]);
 	}
 	if (peak <= 0) { _error(error, error_capacity, "impulse is silent"); goto fail; }
+	if (peak > 16.0) { _error(error, error_capacity, "impulse gain is outside the safe processing range"); goto fail; }
 	free(data); *left = l; *right = r; *taps = frames; *sample_rate = rate; return true;
 fail:
 	free(data); free(l); free(r); return false;

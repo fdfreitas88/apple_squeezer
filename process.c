@@ -67,6 +67,7 @@ static void _report_native_dsp(void) {
 static void _run_samples(void) {
 #if RESAMPLE
 	if (resample_active) {
+		process.out_frames = 0;
 		resample_samples(&process);
 	} else
 #endif
@@ -104,7 +105,7 @@ static void _write_samples(void) {
 		if (f > 0) {
 
 			f = min(f, frames);
-			
+
 			memcpy(optr, iptr, f * BYTES_PER_FRAME);
 			
 			frames -= f;
@@ -204,6 +205,19 @@ unsigned process_newstream(bool *direct, unsigned raw_sample_rate, unsigned supp
 	if (active) {
 
 		unsigned max_in_frames, max_out_frames;
+		uint64_t scaled_frames;
+
+		if (!process.in_sample_rate || !process.out_sample_rate) {
+			LOG_ERROR("invalid processing sample rate: %u -> %u", process.in_sample_rate, process.out_sample_rate);
+#if RESAMPLE
+			resample_active = false;
+#endif
+#if DSP
+			native_dsp_active = false;
+#endif
+			*direct = true;
+			return raw_sample_rate;
+		}
 
 		process.in_frames = process.out_frames = 0;
 		process.total_in = process.total_out = 0;
@@ -214,23 +228,45 @@ unsigned process_newstream(bool *direct, unsigned raw_sample_rate, unsigned supp
 		max_in_frames = codec->min_space / BYTES_PER_FRAME ;
 
 		// increase size of output buffer by 10% as output rate is not an exact multiple of input rate
+		scaled_frames = (uint64_t)max_in_frames * process.out_sample_rate;
 		if (process.out_sample_rate % process.in_sample_rate == 0) {
-			max_out_frames = max_in_frames * (process.out_sample_rate / process.in_sample_rate);
+			scaled_frames /= process.in_sample_rate;
 		} else {
-			max_out_frames = (int)(1.1 * (float)max_in_frames * (float)process.out_sample_rate / (float)process.in_sample_rate);
+			scaled_frames = (scaled_frames * 11U + (uint64_t)process.in_sample_rate * 10U - 1U) /
+				((uint64_t)process.in_sample_rate * 10U);
 		}
+		if (!scaled_frames || scaled_frames > UINT_MAX || scaled_frames > SIZE_MAX / BYTES_PER_FRAME) {
+			LOG_ERROR("processing buffer size is outside the supported range");
+			*direct = true;
+			return raw_sample_rate;
+		}
+		max_out_frames = (unsigned)scaled_frames;
 
 		if (process.max_in_frames != max_in_frames) {
+			void *newbuf;
 			LOG_DEBUG("creating process buf in frames: %u", max_in_frames);
-			if (process.inbuf) free(process.inbuf);
-			process.inbuf = malloc(max_in_frames * BYTES_PER_FRAME);
+			newbuf = malloc(max_in_frames * BYTES_PER_FRAME);
+			if (!newbuf) {
+				LOG_ERROR("malloc fail creating process input buffer");
+				*direct = true;
+				return raw_sample_rate;
+			}
+			free(process.inbuf);
+			process.inbuf = newbuf;
 			process.max_in_frames = max_in_frames;
 		}
-		
+
 		if (process.max_out_frames != max_out_frames) {
+			void *newbuf;
 			LOG_DEBUG("creating process buf out frames: %u", max_out_frames);
-			if (process.outbuf) free(process.outbuf);
-			process.outbuf = malloc(max_out_frames * BYTES_PER_FRAME);
+			newbuf = malloc(max_out_frames * BYTES_PER_FRAME);
+			if (!newbuf) {
+				LOG_ERROR("malloc fail creating process output buffer");
+				*direct = true;
+				return raw_sample_rate;
+			}
+			free(process.outbuf);
+			process.outbuf = newbuf;
 			process.max_out_frames = max_out_frames;
 		}
 		

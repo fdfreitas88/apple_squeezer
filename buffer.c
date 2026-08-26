@@ -47,17 +47,13 @@ unsigned _buf_cont_write(struct buffer *buf) {
 }
 
 void _buf_inc_readp(struct buffer *buf, unsigned by) {
-	buf->readp += by;
-	if (buf->readp >= buf->wrap) {
-		buf->readp -= buf->size;
-	}
+	if (!buf->size) return;
+	buf->readp = buf->buf + ((size_t)(buf->readp - buf->buf) + by % buf->size) % buf->size;
 }
 
 void _buf_inc_writep(struct buffer *buf, unsigned by) {
-	buf->writep += by;
-	if (buf->writep >= buf->wrap) {
-		buf->writep -= buf->size;
-	}
+	if (!buf->size) return;
+	buf->writep = buf->buf + ((size_t)(buf->writep - buf->buf) + by % buf->size) % buf->size;
 }
 
 void buf_flush(struct buffer *buf) {
@@ -71,7 +67,13 @@ void buf_flush(struct buffer *buf) {
 void buf_adjust(struct buffer *buf, size_t mod) {
 	size_t size;
 	mutex_lock(buf->mutex);
-	size = ((unsigned)(buf->base_size / mod)) * mod;
+	if (!mod || !buf->buf || !buf->base_size) {
+		LOG_ERROR("invalid buffer alignment: %zu", mod);
+		mutex_unlock(buf->mutex);
+		return;
+	}
+	size = (buf->base_size / mod) * mod;
+	if (!size) size = buf->base_size;
 	buf->readp  = buf->buf;
 	buf->writep = buf->buf;
 	buf->wrap   = buf->buf + size;
@@ -81,15 +83,16 @@ void buf_adjust(struct buffer *buf, size_t mod) {
 
 // called with mutex locked to resize, does not retain contents, reverts to original size if fails
 void _buf_resize(struct buffer *buf, size_t size) {
-	free(buf->buf);
-	buf->buf = malloc(size);
-	if (!buf->buf) {
-		size    = buf->size;
-		buf->buf= malloc(size);
-		if (!buf->buf) {
-			size = 0;
-		}
+	u8_t *replacement;
+	if (!size) return;
+	replacement = malloc(size);
+	if (!replacement) {
+		LOG_ERROR("unable to resize buffer to %zu bytes; keeping the existing buffer", size);
+		buf->readp = buf->writep = buf->buf;
+		return;
 	}
+	free(buf->buf);
+	buf->buf = replacement;
 	buf->readp  = buf->buf;
 	buf->writep = buf->buf;
 	buf->wrap   = buf->buf + size;
@@ -99,7 +102,7 @@ void _buf_resize(struct buffer *buf, size_t size) {
 
 void _buf_unwrap(struct buffer *buf, size_t cont) {
 	ssize_t len, by = cont - (buf->wrap - buf->readp);
-	size_t size;
+	ssize_t overlap;
 	u8_t *scratch;
 
 	// do nothing if we have enough space
@@ -114,11 +117,11 @@ void _buf_unwrap(struct buffer *buf, size_t cont) {
 	 }
 
 	// how much is overlapping
-	size = by - (buf->readp - buf->writep);
+	overlap = by - (buf->readp - buf->writep);
 	len = buf->writep - buf->buf;
 
 	// buffer is wrapped and enough free space to move data up directly
-	if (size <= 0) {
+	if (overlap <= 0) {
 		memmove(buf->readp - by, buf->readp, buf->wrap - buf->readp);
 		buf->readp -= by;
 		memcpy(buf->wrap - by, buf->buf, min(len, by));
@@ -129,17 +132,17 @@ void _buf_unwrap(struct buffer *buf, size_t cont) {
 		return;
 	}
 
-	scratch = malloc(size);
+	scratch = malloc((size_t)overlap);
 
 	// buffer is wrapped but not enough free room => use scratch zone
 	if (scratch) {
-		memcpy(scratch, buf->writep - size, size);
+		memcpy(scratch, buf->writep - overlap, (size_t)overlap);
 		memmove(buf->readp - by, buf->readp, buf->wrap - buf->readp);
 		buf->readp -= by;
 		memcpy(buf->wrap - by, buf->buf, by);
-		memmove(buf->buf, buf->buf + by, len - by - size);
+		memmove(buf->buf, buf->buf + by, (size_t)(len - by - overlap));
 		buf->writep -= by;
-		memcpy(buf->writep - size, scratch, size);
+		memcpy(buf->writep - overlap, scratch, (size_t)overlap);
 		free(scratch);
 	} else {
 		_buf_unwrap(buf, cont / 2);
@@ -148,13 +151,18 @@ void _buf_unwrap(struct buffer *buf, size_t cont) {
 }
 
 void buf_init(struct buffer *buf, size_t size) {
+	mutex_create_p(buf->mutex);
+	if (size < 2) {
+		buf->buf = buf->readp = buf->writep = buf->wrap = NULL;
+		buf->size = buf->base_size = 0;
+		return;
+	}
 	buf->buf    = malloc(size);
 	buf->readp  = buf->buf;
 	buf->writep = buf->buf;
-	buf->wrap   = buf->buf + size;
-	buf->size   = size;
-	buf->base_size = size;
-	mutex_create_p(buf->mutex);
+	buf->wrap   = buf->buf ? buf->buf + size : NULL;
+	buf->size   = buf->buf ? size : 0;
+	buf->base_size = buf->size;
 }
 
 void buf_destroy(struct buffer *buf) {

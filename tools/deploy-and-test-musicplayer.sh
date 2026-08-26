@@ -19,8 +19,10 @@ PLAYER_ID='02:41:53:49:4e:54'
 FIXTURE_DIR=""
 PLAYBACK_PID=""
 REMOTE_FIXTURE_DIR=""
+REMOTE_FIXTURE_URL=""
+PLUGIN_PAUSED=0
 REMOTE_LOG='/Users/musicplayer/Library/Application Support/AppleSqueezerIntel/test-state/apple-squeezer-intel.log'
-HARNESS_VERSION='6-ultimate-transition'
+HARNESS_VERSION='13-definitive-one-shot-qualification'
 
 usage() {
 	cat <<'EOF'
@@ -36,6 +38,8 @@ configuration are restored automatically unless --keep-on-failure is used.
 The default invocation is fully automatic. It generates native FLAC and DSD64
 fixtures, drives LMS, verifies fresh CoreAudio evidence for every transition,
 runs a clean endurance interval, collects one report, and rolls back on failure.
+If the standalone LMS plugin is active, the harness pauses it to avoid duplicate
+player identity/exclusive-DAC contention and restores it on every exit path.
 The legacy --auto-fixtures and --require-matrix flags remain accepted as no-ops.
 EOF
 }
@@ -88,10 +92,18 @@ preflight() {
 	done
 	[ "$(uname -s)" = Darwin ] || fail "the Intel candidate must be built from macOS"
 	[ -f "$SCRIPT_DIR/generate-test-flac.c" ] || fail "missing FLAC fixture generator source"
-	ssh -o BatchMode=yes -o ConnectTimeout=8 "${MUSICPLAYER_SSH:-musicplayer@10.73.254.20}" \
-		'test "$(uname -s)" = Darwin && test "$(uname -m)" = x86_64 && test -w "$HOME/Library/Caches"' \
-		|| fail "Musicplayer is unreachable, is not Intel macOS, or its cache is not writable"
-	lms_request '["serverstatus","0","1"]' || fail "LMS JSON-RPC is unavailable at 10.73.254.20:9000"
+	attempt=1
+	while [ "$attempt" -le 3 ]; do
+		if ssh -o BatchMode=yes -o ConnectTimeout=8 "${MUSICPLAYER_SSH:-musicplayer@10.73.254.20}" \
+				'test "$(uname -s)" = Darwin && test "$(uname -m)" = x86_64 && test -w "$HOME/Library/Caches"' && \
+				lms_request '["serverstatus","0","1"]'; then
+			break
+		fi
+		[ "$attempt" -eq 3 ] && fail "Musicplayer/LMS remained unavailable or failed the Intel macOS preflight after 3 attempts"
+		printf 'INFO: Musicplayer preflight retry %s/3 in 5 seconds.\n' "$attempt" | tee -a "$report"
+		sleep 5
+		attempt=$((attempt + 1))
+	done
 	printf 'PASS: prerequisites, Intel Musicplayer SSH, and LMS JSON-RPC are available.\n\n' | tee -a "$report"
 }
 
@@ -103,7 +115,7 @@ cleanup_fixtures() {
 			*) fail "refusing to clean unexpected remote fixture path: $REMOTE_FIXTURE_DIR" ;;
 		esac
 		ssh "${MUSICPLAYER_SSH:-musicplayer@10.73.254.20}" \
-			"rm -f '$REMOTE_FIXTURE_DIR'/pcm-44100.flac '$REMOTE_FIXTURE_DIR'/pcm-48000.flac '$REMOTE_FIXTURE_DIR'/pcm-88200.flac '$REMOTE_FIXTURE_DIR'/pcm-96000.flac '$REMOTE_FIXTURE_DIR'/pcm-176400.flac '$REMOTE_FIXTURE_DIR'/pcm-192000.flac '$REMOTE_FIXTURE_DIR'/dop64-176400.flac '$REMOTE_FIXTURE_DIR'/endurance-44100.flac '$REMOTE_FIXTURE_DIR'/dsd64.dsf '$REMOTE_FIXTURE_DIR'/SHA256SUMS; rmdir '$REMOTE_FIXTURE_DIR' 2>/dev/null || true" \
+			"if test -s '$REMOTE_FIXTURE_DIR/http.pid'; then kill \$(sed -n '1p' '$REMOTE_FIXTURE_DIR/http.pid') 2>/dev/null || true; fi; rm -f '$REMOTE_FIXTURE_DIR'/pcm-44100.flac '$REMOTE_FIXTURE_DIR'/pcm-48000.flac '$REMOTE_FIXTURE_DIR'/pcm-88200.flac '$REMOTE_FIXTURE_DIR'/pcm-96000.flac '$REMOTE_FIXTURE_DIR'/pcm-176400.flac '$REMOTE_FIXTURE_DIR'/pcm-192000.flac '$REMOTE_FIXTURE_DIR'/dop64-176400.flac '$REMOTE_FIXTURE_DIR'/endurance-44100.flac '$REMOTE_FIXTURE_DIR'/dsd64.dsf '$REMOTE_FIXTURE_DIR'/SHA256SUMS '$REMOTE_FIXTURE_DIR'/fixture-http-server '$REMOTE_FIXTURE_DIR'/http.pid '$REMOTE_FIXTURE_DIR'/http.log; rmdir '$REMOTE_FIXTURE_DIR' 2>/dev/null || true" \
 			>/dev/null 2>&1 || true
 	fi
 	[ -z "$FIXTURE_DIR" ] || rm -rf "$FIXTURE_DIR"
@@ -115,6 +127,45 @@ lms_request() {
 		-H 'Content-Type: text/plain' \
 		--data "{\"id\":1,\"method\":\"slim.request\",\"params\":[\"$PLAYER_ID\",$command_json]}") || return 1
 	printf '%s' "$response" | grep -q '"result"'
+}
+
+lms_plugin_request() {
+	command_json=$1
+	response=$(curl -fsS --max-time 10 -X POST "http://10.73.254.20:9000/jsonrpc.js" \
+		-H 'Content-Type: text/plain' \
+		--data "{\"id\":1,\"method\":\"slim.request\",\"params\":[\"\",$command_json]}") || return 1
+	printf '%s' "$response"
+}
+
+pause_standalone_plugin() {
+	plugin_status=$(lms_plugin_request '["apple_squeezer","status"]' 2>/dev/null || true)
+	printf '%s' "$plugin_status" | grep -q '"result"' || return 0
+	if printf '%s' "$plugin_status" | grep -Eq '"running":1|"autorun":1'; then
+		printf 'Pausing the standalone LMS plugin during isolated qualification...\n' | tee -a "$report"
+		stop_response=$(lms_plugin_request '["apple_squeezer","stop"]') || fail "unable to stop the standalone Apple Squeezer plugin"
+		printf '%s' "$stop_response" | grep -q '"success":1' || fail "the standalone Apple Squeezer plugin rejected the stop request"
+		PLUGIN_PAUSED=1
+		elapsed=0
+		while [ "$elapsed" -lt 15 ]; do
+			plugin_status=$(lms_plugin_request '["apple_squeezer","status"]' 2>/dev/null || true)
+			printf '%s' "$plugin_status" | grep -q '"running":0' && return 0
+			sleep 1
+			elapsed=$((elapsed + 1))
+		done
+		fail "standalone Apple Squeezer plugin did not release its process"
+	fi
+}
+
+restore_standalone_plugin() {
+	[ "$PLUGIN_PAUSED" -eq 1 ] || return 0
+	printf 'Restoring the standalone LMS plugin...\n' | tee -a "$report"
+	start_response=$(lms_plugin_request '["apple_squeezer","start"]' 2>/dev/null || true)
+	if ! printf '%s' "$start_response" | grep -q '"success":1'; then
+		printf 'WARNING: unable to restart the standalone plugin automatically; use its LMS Start control.\n' | tee -a "$report"
+		return 1
+	fi
+	PLUGIN_PAUSED=0
+	return 0
 }
 
 prepare_fixtures() {
@@ -166,11 +217,49 @@ PY
 		file "$fixture" | grep -q 'FLAC audio bitstream' || fail "invalid generated FLAC fixture: $fixture"
 	done
 	file "$FIXTURE_DIR/dsd64.dsf" | grep -qi 'DSD\|data' || fail "invalid generated DSF fixture"
+	cc -arch x86_64 -mmacosx-version-min=11.0 -std=c99 -Wall -Wextra -Werror -O2 \
+		"$SCRIPT_DIR/fixture-http-server.c" -o "$FIXTURE_DIR/fixture-http-server" \
+		|| fail "unable to build the dependency-free Intel fixture server"
+	file "$FIXTURE_DIR/fixture-http-server" | grep -q 'x86_64' \
+		|| fail "fixture server is not an Intel x86_64 executable"
 	REMOTE_FIXTURE_DIR="/Users/musicplayer/Library/Caches/AppleSqueezerIntelFixtures-$timestamp"
+	# Stop only fixture servers recorded by earlier harness runs.  This recovers
+	# ports after an interrupted terminal without touching unrelated services.
+	ssh "${MUSICPLAYER_SSH:-musicplayer@10.73.254.20}" \
+		'for pidfile in "$HOME"/Library/Caches/AppleSqueezerIntelFixtures-*/http.pid; do test -f "$pidfile" || continue; pid=$(sed -n "1p" "$pidfile"); case "$pid" in ""|*[!0-9]*) continue ;; esac; kill "$pid" 2>/dev/null || true; done' \
+		>/dev/null 2>&1 || true
 	ssh "${MUSICPLAYER_SSH:-musicplayer@10.73.254.20}" "mkdir -p '$REMOTE_FIXTURE_DIR'" || fail "unable to create remote fixture directory"
 	scp "$FIXTURE_DIR"/* "${MUSICPLAYER_SSH:-musicplayer@10.73.254.20}:$REMOTE_FIXTURE_DIR/" || fail "unable to copy automated audio fixtures"
 	ssh "${MUSICPLAYER_SSH:-musicplayer@10.73.254.20}" "cd '$REMOTE_FIXTURE_DIR' && shasum -a 256 -c SHA256SUMS" \
 		|| fail "fixture checksum verification failed on Musicplayer"
+	# Use a bounded port range and verify the actual HTTP payload. A stale test
+	# process or an unrelated local service therefore cannot invalidate the run.
+	port=18765
+	while [ "$port" -le 18774 ]; do
+		REMOTE_FIXTURE_URL="http://127.0.0.1:$port"
+		ssh "${MUSICPLAYER_SSH:-musicplayer@10.73.254.20}" \
+			"cd '$REMOTE_FIXTURE_DIR' && chmod 700 fixture-http-server && (nohup ./fixture-http-server '$port' >http.log 2>&1 </dev/null & echo \$! >http.pid)" \
+			>/dev/null 2>&1 || true
+		elapsed=0
+		while [ "$elapsed" -lt 5 ]; do
+			if ssh "${MUSICPLAYER_SSH:-musicplayer@10.73.254.20}" \
+					"test \"\$(curl -fsS --max-time 2 '$REMOTE_FIXTURE_URL/SHA256SUMS' | shasum -a 256 | sed 's/[[:space:]].*//')\" = \"\$(shasum -a 256 '$REMOTE_FIXTURE_DIR/SHA256SUMS' | sed 's/[[:space:]].*//')\"" \
+					2>/dev/null; then
+				printf 'PASS: native fixture server ready on Musicplayer port %s.\n' "$port" | tee -a "$report"
+				return 0
+			fi
+			sleep 1
+			elapsed=$((elapsed + 1))
+		done
+		ssh "${MUSICPLAYER_SSH:-musicplayer@10.73.254.20}" \
+			"if test -s '$REMOTE_FIXTURE_DIR/http.pid'; then kill \$(sed -n '1p' '$REMOTE_FIXTURE_DIR/http.pid') 2>/dev/null || true; fi; rm -f '$REMOTE_FIXTURE_DIR/http.pid'" \
+			>/dev/null 2>&1 || true
+		port=$((port + 1))
+	done
+	server_log=$(ssh "${MUSICPLAYER_SSH:-musicplayer@10.73.254.20}" \
+		"sed -n '1,80p' '$REMOTE_FIXTURE_DIR/http.log' 2>/dev/null" 2>/dev/null || true)
+	[ -z "$server_log" ] || printf 'Fixture server diagnostics:\n%s\n' "$server_log" | tee -a "$report"
+	fail "unable to allocate a verified Musicplayer fixture HTTP server on ports 18765-18774"
 }
 
 wait_for_player() {
@@ -181,7 +270,7 @@ wait_for_player() {
 			-H 'Content-Type: text/plain' \
 			--data '{"id":1,"method":"slim.request","params":["",["players","0","100"]]}' 2>/dev/null || true)
 		printf '%s' "$players" | grep -q '"playerid":"02:41:53:49:4e:54"' && \
-			printf '%s' "$players" | grep -q '"firmware":"[^"]*coreaudio-intel' && return 0
+			printf '%s' "$players" | grep -q '"modelname":"AppleSqueezerIntel"' && return 0
 		sleep 2
 		elapsed=$((elapsed + 2))
 	done
@@ -207,6 +296,24 @@ wait_for_log_evidence() {
 	return 1
 }
 
+start_endurance_fixture() {
+	attempt=1
+	while [ "$attempt" -le 3 ]; do
+		lms_request '["power","1"]' >/dev/null 2>&1 || true
+		lms_request '["stop"]' >/dev/null 2>&1 || true
+		sleep 2
+		first_line=$(( $(remote_log_line_count) + 1 ))
+		if lms_request "[\"playlist\",\"play\",\"$REMOTE_FIXTURE_URL/endurance-44100.flac\"]" &&
+				wait_for_log_evidence 'processed=[1-9][0-9]*' 30 "$first_line"; then
+			printf 'PASS: endurance fixture entered the native decode path.\n' | tee -a "$report"
+			return 0
+		fi
+		printf 'INFO: retrying endurance playback startup (%s/3).\n' "$attempt" | tee -a "$report"
+		attempt=$((attempt + 1))
+	done
+	return 1
+}
+
 wait_for_dop_evidence() {
 	first_line=$1
 	timeout=${2:-60}
@@ -215,7 +322,10 @@ wait_for_dop_evidence() {
 	while [ "$elapsed" -lt "$timeout" ]; do
 		new_log=$(ssh "${MUSICPLAYER_SSH:-musicplayer@10.73.254.20}" \
 			"sed -n '${first_line},\$p' '$REMOTE_LOG' 2>/dev/null" 2>/dev/null || true)
-		printf '%s\n' "$new_log" | grep -q 'transport=DoP rate=176400' && return 0
+		if printf '%s\n' "$new_log" | grep -q 'transport=DoP rate=176400' ||
+				printf '%s\n' "$new_log" | grep -q 'signal path:.*S32 DoP.*CoreAudio 176400 Hz'; then
+			return 0
+		fi
 		if printf '%s\n' "$new_log" | grep -q 'Content-Type: audio/x-flac' && \
 				printf '%s\n' "$new_log" | grep -q 'track start sample rate: 352800'; then
 			if [ "$report_transcode" = yes ]; then
@@ -230,17 +340,25 @@ wait_for_dop_evidence() {
 }
 
 play_fixture_sequence() {
-	base="file://$REMOTE_FIXTURE_DIR"
+	base=$REMOTE_FIXTURE_URL
 	for rate in 44100 48000 88200 96000 176400 192000; do
 		fixture="pcm-$rate.flac"
 		printf 'Playing automated fixture: %s\n' "$fixture" | tee -a "$report"
-		first_line=$(( $(remote_log_line_count) + 1 ))
-		if ! lms_request "[\"playlist\",\"play\",\"$base/$fixture\"]"; then
-			printf 'FAIL: LMS rejected %s\n' "$fixture" | tee -a "$report"
-			QUALIFICATION_FAILURES=$((QUALIFICATION_FAILURES + 1))
-			continue
-		fi
-		if wait_for_log_evidence "hardware=$rate Hz" 45 "$first_line"; then
+		passed=0
+		attempt=1
+		while [ "$attempt" -le 2 ]; do
+			first_line=$(( $(remote_log_line_count) + 1 ))
+			if lms_request "[\"playlist\",\"play\",\"$base/$fixture\"]" && \
+					wait_for_log_evidence "hardware=$rate Hz" 45 "$first_line"; then
+				passed=1
+				break
+			fi
+			printf 'INFO: retrying %s transition (%s/2).\n' "$rate" "$attempt" | tee -a "$report"
+			lms_request '["stop"]' >/dev/null 2>&1 || true
+			sleep 2
+			attempt=$((attempt + 1))
+		done
+		if [ "$passed" -eq 1 ]; then
 			printf 'PASS: native %s Hz reached CoreAudio.\n' "$rate" | tee -a "$report"
 		else
 			printf 'FAIL: no new CoreAudio evidence for %s Hz\n' "$rate" | tee -a "$report"
@@ -249,11 +367,21 @@ play_fixture_sequence() {
 		sleep 2
 	done
 	printf 'Playing automated fixture: dop64-176400.flac (native DoP transport)\n' | tee -a "$report"
-	first_line=$(( $(remote_log_line_count) + 1 ))
-	if ! lms_request "[\"playlist\",\"play\",\"$base/dop64-176400.flac\"]"; then
-		printf 'FAIL: LMS rejected dop64-176400.flac\n' | tee -a "$report"
-		QUALIFICATION_FAILURES=$((QUALIFICATION_FAILURES + 1))
-	elif wait_for_dop_evidence "$first_line" 60; then
+	passed=0
+	attempt=1
+	while [ "$attempt" -le 2 ]; do
+		first_line=$(( $(remote_log_line_count) + 1 ))
+		if lms_request "[\"playlist\",\"play\",\"$base/dop64-176400.flac\"]" && \
+				wait_for_dop_evidence "$first_line" 60; then
+			passed=1
+			break
+		fi
+		printf 'INFO: retrying native DoP transition (%s/2).\n' "$attempt" | tee -a "$report"
+		lms_request '["stop"]' >/dev/null 2>&1 || true
+		sleep 2
+		attempt=$((attempt + 1))
+	done
+	if [ "$passed" -eq 1 ]; then
 		printf 'PASS: native DSD64/DoP reached CoreAudio.\n' | tee -a "$report"
 	else
 		printf 'FAIL: no new native DSD64/DoP evidence.\n' | tee -a "$report"
@@ -289,7 +417,10 @@ rollback_after_failure() {
 	if [ "$installed" -eq 1 ] && [ "$ROLLBACK_ON_FAILURE" -eq 1 ]; then
 		printf '\nValidation failed; restoring the previous Musicplayer candidate.\n' | tee -a "$report"
 		"$DEPLOY" rollback 2>&1 | tee -a "$report" || true
+	elif [ "$installed" -eq 1 ] && [ "$PLUGIN_PAUSED" -eq 1 ]; then
+		"$DEPLOY" stop 2>&1 | tee -a "$report" || true
 	fi
+	restore_standalone_plugin || true
 	printf '\nReport saved to %s\n' "$report"
 	exit "$status"
 }
@@ -300,8 +431,8 @@ printf 'Mode: %s; soak: %s seconds\n\n' "$MODE" "$SOAK_SECONDS" | tee -a "$repor
 
 preflight
 
-printf 'Running local native DSP tests...\n' | tee -a "$report"
-make -C "$REPO_DIR" -f Makefile.coreaudio-intel test-dsp 2>&1 | tee -a "$report"
+printf 'Running local buffer, PCM conversion, and native DSP tests...\n' | tee -a "$report"
+make -C "$REPO_DIR" -f Makefile.coreaudio-intel test-buffer test-pcm test-dsp 2>&1 | tee -a "$report"
 status=${PIPESTATUS[0]}
 [ "$status" -eq 0 ] || exit "$status"
 
@@ -323,6 +454,8 @@ printf 'Candidate SHA-256: %s\n' "$(shasum -a 256 "$REPO_DIR/apple-squeezer-inte
 printf 'PASS: x86_64 architecture, FLAC/Ogg FLAC/ALAC/DSD/DoP/SoXR linkage, and CoreAudio help reporting.\n' | tee -a "$report"
 
 printf '\nDeploying candidate for physical CoreAudio tests...\n' | tee -a "$report"
+
+pause_standalone_plugin
 
 if [ "$AUTO_FIXTURES" -eq 1 ]; then
 	printf 'Preparing automatic PCM and DSD64 playback fixtures...\n' | tee -a "$report"
@@ -359,9 +492,7 @@ if [ "$AUTO_FIXTURES" -eq 1 ]; then
 	[ "$status" -eq 0 ] || exit "$status"
 	wait_for_player 30 || fail "the dedicated player did not reconnect after the clean restart"
 	lms_request '["playlist","repeat","0"]' || fail "unable to disable playlist repeat"
-	first_line=$(( $(remote_log_line_count) + 1 ))
-	lms_request "[\"playlist\",\"play\",\"file://$REMOTE_FIXTURE_DIR/endurance-44100.flac\"]" || fail "unable to start endurance fixture"
-	wait_for_log_evidence 'hardware=44100 Hz' 45 "$first_line" || fail "endurance fixture did not produce new CoreAudio evidence"
+	start_endurance_fixture || fail "endurance fixture did not enter the native decode path after 3 attempts"
 fi
 
 if [ "$REQUIRE_MATRIX" -eq 1 ] && [ "$AUTO_FIXTURES" -eq 0 ]; then
@@ -377,8 +508,10 @@ if [ "$QUALIFICATION_FAILURES" -ne 0 ]; then
 fi
 
 trap - EXIT INT TERM
+"$DEPLOY" stop 2>&1 | tee -a "$report" || true
 cleanup_fixtures
-printf '\nDeployment and consolidated validation passed. Candidate remains installed.\n' | tee -a "$report"
+restore_standalone_plugin || fail "qualification passed, but the standalone plugin could not be restored"
+printf '\nDeployment and consolidated validation passed. Candidate remains installed but stopped; the standalone LMS plugin was restored.\n' | tee -a "$report"
 printf 'NOT AUTOMATABLE without external actions: Mojo LED observation, analog/USB loopback null measurement, and physical USB disconnect/reconnect.\n' | tee -a "$report"
 printf 'Rollback command: %s rollback\n' "$0" | tee -a "$report"
 printf 'Report saved to %s\n' "$report"

@@ -61,7 +61,15 @@ $(FLAC_LIBRARY): $(OGG_LIBRARY)
 		-DWITH_OGG=ON -DENABLE_MULTITHREADING=OFF -DBUILD_SHARED_LIBS=OFF
 	cmake --build $(FLAC_BUILD) --target FLAC -j4
 
-.PHONY: test-dsp
+.PHONY: test-dsp test-buffer test-pcm
 test-dsp:
 	$(CC) -std=gnu99 -Wall -Wextra -O2 -DDSP -I. tools/test-dsp.c dsp.c dsp_config.c dsp_ir.c -lm -lpthread -o /tmp/apple-squeezer-test-dsp
 	/tmp/apple-squeezer-test-dsp
+
+test-buffer:
+	$(CC) -std=gnu99 -Wall -Wextra -O2 -I. tools/test-buffer.c buffer.c -lpthread -o /tmp/apple-squeezer-test-buffer
+	/tmp/apple-squeezer-test-buffer
+
+test-pcm:
+	$(CC) -std=c99 -Wall -Wextra -Werror -O2 -I. tools/test-pcm-conversion.c -o /tmp/apple-squeezer-test-pcm
+	/tmp/apple-squeezer-test-pcm

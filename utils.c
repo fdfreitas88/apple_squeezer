@@ -299,6 +299,7 @@ void set_nonblock(sockfd s) {
 
 // Reduce TCP receive buffer size to avoid WSAECONNRESET socket errors on windows.
 void set_recvbufsize(sockfd s) {
+	(void)s;
 #if WIN
 	int opt;
 	int len = sizeof(opt);

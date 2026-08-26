@@ -467,7 +467,8 @@ mojo_report() {
 			missing=$((missing + 1))
 		fi
 	done
-	if grep -q 'transport=DoP rate=176400' "$LOG_FILE"; then
+	if grep -q 'transport=DoP rate=176400' "$LOG_FILE" ||
+			grep -q 'signal path:.*S32 DoP.*CoreAudio 176400 Hz' "$LOG_FILE"; then
 		note "PASS: DSD64/DoP transport at 176400 Hz observed"
 	else
 		note "MISSING: DSD64/DoP at 176400 Hz"

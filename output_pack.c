@@ -364,15 +364,22 @@ void _scale_and_pack_frames(void *outputptr, s32_t *inputptr, frames_t cnt, s32_
 inline 
 #endif
 void _apply_cross(struct buffer *outputbuf, frames_t out_frames, s32_t cross_gain_in, s32_t cross_gain_out, s32_t **cross_ptr) {
+	if (!outputbuf || !outputbuf->buf || !outputbuf->size || !cross_ptr || !*cross_ptr) return;
 	s32_t *ptr = (s32_t *)(void *)outputbuf->readp;
 	frames_t count = out_frames * 2;
+	s32_t *base = (s32_t *)(void *)outputbuf->buf;
+	size_t samples = outputbuf->size / sizeof(*base);
+	uintptr_t address = (uintptr_t)*cross_ptr;
+	size_t offset = address >= (uintptr_t)outputbuf->buf && address < (uintptr_t)outputbuf->wrap ?
+		(address - (uintptr_t)outputbuf->buf) / sizeof(*base) : 0;
+	if (!samples) return;
+	offset %= samples;
 	while (count--) {
-		if (*cross_ptr > (s32_t *)outputbuf->wrap) {
-			*cross_ptr -= outputbuf->size / BYTES_PER_FRAME * 2;
-		}
-		*ptr = gain(cross_gain_out, *ptr) + gain(cross_gain_in, **cross_ptr);
-		ptr++; (*cross_ptr)++;
+		s64_t mixed = (s64_t)gain(cross_gain_out, *ptr) + (s64_t)gain(cross_gain_in, base[offset]);
+		*ptr++ = mixed > INT32_MAX ? INT32_MAX : mixed < INT32_MIN ? INT32_MIN : (s32_t)mixed;
+		offset = (offset + 1) % samples;
 	}
+	*cross_ptr = base + offset;
 }
 
 #if !WIN
@@ -385,7 +392,8 @@ void _apply_gain(struct buffer *outputbuf, frames_t count, s32_t gainL, s32_t ga
 		ISAMPLE_T *ptrL = (ISAMPLE_T *)(void *)outputbuf->readp;
 		ISAMPLE_T *ptrR = (ISAMPLE_T *)(void *)outputbuf->readp + 1;
 		while (count--) {
-			*ptrL = *ptrR = (gain(gainL, *ptrL) + gain(gainR, *ptrR)) / 2;
+			s64_t mixed = ((s64_t)gain(gainL, *ptrL) + (s64_t)gain(gainR, *ptrR)) / 2;
+			*ptrL = *ptrR = mixed > INT32_MAX ? INT32_MAX : mixed < INT32_MIN ? INT32_MIN : (s32_t)mixed;
 			ptrL += 2; ptrR += 2;
 		}
 

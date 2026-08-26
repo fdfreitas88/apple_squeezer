@@ -662,6 +662,7 @@ struct dsp_telemetry {
 };
 
 bool dsp_init(const char *opt);
+void dsp_close(void);
 bool dsp_configure(const char *opt);
 bool dsp_validate(const char *opt);
 bool dsp_newstream(unsigned sample_rate);
@@ -798,6 +799,8 @@ void output_init_coreaudio(log_level level, const char *device, unsigned output_
 void output_close_coreaudio(void);
 void _coreaudio_open(void);
 void coreaudio_note_output_flush(void);
+bool coreaudio_rendering(void);
+void coreaudio_defer_wake(void);
 #endif
 
 // output_pulse.c

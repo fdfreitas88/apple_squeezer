@@ -227,6 +227,7 @@ static void _disconnect(stream_state state, disconnect_code disconnect) {
 }
 
 static int connect_socket(bool use_ssl) {
+	(void)use_ssl;
 	int sock = socket(AF_INET, SOCK_STREAM, 0);
 
 	if (sock < 0) {
@@ -300,6 +301,7 @@ static u32_t inline itohl(u32_t littlelong) {
 #if !USE_LIBOGG
 static size_t memfind(const u8_t* haystack, size_t n, const char* needle, size_t len, size_t* offset) {
 	size_t i;
+	if (!haystack || !needle || !offset || !len || *offset >= len) return 0;
 	for (i = 0; i < n && *offset != len; i++) *offset = (haystack[i] == needle[*offset]) ? *offset + 1 : 0;
 	return i;
 }
@@ -309,7 +311,7 @@ static size_t memfind(const u8_t* haystack, size_t n, const char* needle, size_t
  * level, which means there is a risk of missing the searched comment if they are not on the 
  * first page of the vorbis_comment packet... nothing is perfect */
 static void stream_ogg(size_t n) {
-	if (ogg.state == STREAM_OGG_OFF) return;
+	if (ogg.state == STREAM_OGG_OFF || !streambuf || !streambuf->writep) return;
 	u8_t* p = streambuf->writep;
 
 	while (n) {
@@ -317,7 +319,7 @@ static void stream_ogg(size_t n) {
 
 		// copy as many bytes as possible and come back later if we don't have enough
 		if (ogg.data) {
-			memcpy(ogg.data + ogg.want - ogg.miss, p, consumed);
+			if (consumed) memcpy(ogg.data + ogg.want - ogg.miss, p, consumed);
 			ogg.miss -= consumed;
 			if (ogg.miss) return;
 		}
@@ -354,15 +356,25 @@ static void stream_ogg(size_t n) {
 			}
 			break;
 		case STREAM_OGG_SEGMENTS:
+			if (!ogg.data) {
+				ogg.state = STREAM_OGG_SYNC;
+				ogg.want = ogg.miss = 0;
+				break;
+			}
 			// calculate size of page using lacing values
 			for (size_t i = 0; i < ogg.want; i++) ogg.miss += ogg.data[i];
 			ogg.want = ogg.miss;
+			if (!ogg.want) {
+				ogg.state = STREAM_OGG_SYNC;
+				ogg.data = NULL;
+				break;
+			}
 
 			// acquire serial number when we are looking for headers and hit a bos
 			if (ogg.serial == ULLONG_MAX && (ogg.header.type & 0x02)) ogg.serial = ogg.header.serial;
 
 			// we have overshot and missed header, reset serial number to restart search (O and -1 are le/be)
-			if (ogg.header.serial == ogg.serial && ogg.header.granule && ogg.header.granule != -1) ogg.serial = ULLONG_MAX;
+			if (ogg.header.serial == ogg.serial && ogg.header.granule && ogg.header.granule != UINT64_MAX) ogg.serial = ULLONG_MAX;
 
 			// not our serial (the above protected us from granule > 0)
 			if (ogg.header.serial != ogg.serial) {
@@ -372,43 +384,61 @@ static void stream_ogg(size_t n) {
 			} else {
 				ogg.state = STREAM_OGG_PAGE;
 				ogg.data = malloc(ogg.want);
+				if (ogg.want && !ogg.data) {
+					LOG_ERROR("unable to allocate Ogg page buffer: %zu bytes", ogg.want);
+					ogg.state = STREAM_OGG_SYNC;
+					ogg.want = ogg.miss = 0;
+				}
 			}
 			break;
 		case STREAM_OGG_PAGE: {
 			char** tag = (char* []){ "\x3vorbis", "OpusTags", NULL };
 			size_t ofs = 0;
+			if (!ogg.data) goto malformed_ogg_page;
 
 			/* with OggFlac, we need the next page (packet) - VorbisComment is wrapped into a FLAC_METADATA
 			 * and except with vorbis, comment packet starts a new page but even in vorbis, it won't span
 			 * accross multiple pages */
-			if (ogg.flac) ofs = 4;
-			else if (!memcmp(ogg.data, "\x7f""FLAC", 5)) ogg.flac = true;
+			if (ogg.flac) {
+				if (ogg.want < 4) goto malformed_ogg_page;
+				ofs = 4;
+			}
+			else if (ogg.want >= 5 && !memcmp(ogg.data, "\x7f""FLAC", 5)) ogg.flac = true;
 			else for (size_t n = 0; *tag; tag++, ofs = 0) if ((ofs = memfind(ogg.data, ogg.want, *tag, strlen(*tag), &n)) && n == strlen(*tag)) break;
 	
 			if (ofs) {
 				// u32:len,char[]:vendorId, u32:N, N x (u32:len,char[]:comment)
+				char* end = (char *)ogg.data + ogg.want;
 				char* p = (char*) ogg.data + ofs;
-				p += itohl(PTR_U32(p)) + 4;
-				u32_t count = itohl(PTR_U32(p));
+				u32_t vendor_len, count;
+				if (ofs > ogg.want || (size_t)(end - p) < 4) goto malformed_ogg_page;
+				vendor_len = itohl(PTR_U32(p));
+				if (vendor_len > (size_t)(end - p) - 4U) goto malformed_ogg_page;
+				p += (size_t)vendor_len + 4U;
+				if ((size_t)(end - p) < 4) goto malformed_ogg_page;
+				count = itohl(PTR_U32(p));
 				p += 4;
 
 				// LMS metadata format for Ogg is "Ogg", N x (u16:len,char[]:comment)
 				memcpy(stream.header, "Ogg", 3);
 				stream.header_len = 3;
 
-				for (u32_t len; count--; p += len) {
+				for (u32_t len; count--;) {
+					if ((size_t)(end - p) < 4) goto malformed_ogg_page;
 					len = itohl(PTR_U32(p));
 					p += 4;
+					if (len > (size_t)(end - p)) goto malformed_ogg_page;
 
 					// only report what we use and don't overflow (network byte order)
 					if (!strncasecmp(p, "TITLE=", 6) || !strncasecmp(p, "ARTIST=", 7) || !strncasecmp(p, "ALBUM=", 6)) {
-						if (stream.header_len + len > MAX_HEADER) break;
+						if (len > UINT16_MAX || len > MAX_HEADER - stream.header_len - 2U) break;
 						stream.header[stream.header_len++] = len >> 8;
 						stream.header[stream.header_len++] = len;
 						memcpy(stream.header + stream.header_len, p, len);
 						stream.header_len += len;
 						LOG_INFO("metadata: %.*s", len, p);
 					}
+					p += len;
 				}
 
 				ogg.flac = false;
@@ -418,6 +448,7 @@ static void stream_ogg(size_t n) {
 				LOG_INFO("metadata length: %u", stream.header_len - 3);
 			}
 
+		malformed_ogg_page:
 			free(ogg.data);
 			ogg.data = NULL;
 			ogg.state = STREAM_OGG_SYNC;
@@ -466,34 +497,43 @@ static void stream_ogg(size_t n) {
 
 			// if case of OggFlac, VorbisComment is a flac METADATA_BLOC as 2nd packet (4 bytes in)
 			if (ogg.flac) ofs = 4;
-			else if (!memcmp(ogg.packet.packet, "\x7f""FLAC", 5)) ogg.flac = true;
-			else for (char** tag = (char* []){ "\x3vorbis", "OpusTags", NULL }; *tag && !ofs; tag++) if (!memcmp(ogg.packet.packet, *tag, strlen(*tag))) ofs = strlen(*tag);
+			else if (ogg.packet.bytes >= 5 && !memcmp(ogg.packet.packet, "\x7f""FLAC", 5)) ogg.flac = true;
+			else for (char** tag = (char* []){ "\x3vorbis", "OpusTags", NULL }; *tag && !ofs; tag++) if (ogg.packet.bytes >= (long)strlen(*tag) && !memcmp(ogg.packet.packet, *tag, strlen(*tag))) ofs = strlen(*tag);
 
 			if (!ofs) continue;
 
 			// u32:len,char[]:vendorId, u32:N, N x (u32:len,char[]:comment)
+			char* end = (char *)ogg.packet.packet + ogg.packet.bytes;
 			char* p = (char*)ogg.packet.packet + ofs;
-			p += itohl(PTR_U32(p)) + 4;
-			u32_t count = itohl(PTR_U32(p));
+			u32_t vendor_len, count;
+			if (ogg.packet.bytes < 0 || ofs > (size_t)ogg.packet.bytes || (size_t)(end - p) < 4) continue;
+			vendor_len = itohl(PTR_U32(p));
+			if (vendor_len > (size_t)(end - p) - 4U) continue;
+			p += (size_t)vendor_len + 4U;
+			if ((size_t)(end - p) < 4) continue;
+			count = itohl(PTR_U32(p));
 			p += 4;
 
 			// LMS metadata format for Ogg is "Ogg", N x (u16:len,char[]:comment)
 			memcpy(stream.header, "Ogg", 3);
 			stream.header_len = 3;
 
-			for (u32_t len; count--; p += len) {
+			for (u32_t len; count--;) {
+				if ((size_t)(end - p) < 4) break;
 				len = itohl(PTR_U32(p));
 				p += 4;
+				if (len > (size_t)(end - p)) break;
 
 				// only report what we use and don't overflow (network byte order)
 				if (!strncasecmp(p, "TITLE=", 6) || !strncasecmp(p, "ARTIST=", 7) || !strncasecmp(p, "ALBUM=", 6)) {
-					if (stream.header_len + len > MAX_HEADER) break;
+					if (len > UINT16_MAX || len > MAX_HEADER - stream.header_len - 2U) break;
 					stream.header[stream.header_len++] = len >> 8;
 					stream.header[stream.header_len++] = len;
 					memcpy(stream.header + stream.header_len, p, len);
 					stream.header_len += len;
 					LOG_INFO("metadata: %.*s", len, p);
 				}
+				p += len;
 			}
 
 			// ogg_packet_clear does not need to be called as metadata packets terminate a page
@@ -511,6 +551,7 @@ static void stream_ogg(size_t n) {
 #endif
 
 static void *stream_thread(void *vargp) {
+	(void)vargp;
 	while (running) {
 
 		struct pollfd pollinfo;
@@ -615,13 +656,14 @@ static void *stream_thread(void *vargp) {
 						continue;
 					}
 
-					*(stream.header + stream.header_len) = c;
-					stream.header_len++;
-
-					if (stream.header_len > MAX_HEADER - 1) {
+					if (stream.header_len >= MAX_HEADER - 1) {
 						LOG_ERROR("received headers too long: %u", stream.header_len);
 						_disconnect(DISCONNECT, LOCAL_DISCONNECT);
+						endtok = 0;
+						UNLOCK;
+						continue;
 					}
+					*(stream.header + stream.header_len++) = c;
 
 					if (stream.header_len > 1 && (c == '\r' || c == '\n')) {
 						endtok++;

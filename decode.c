@@ -54,6 +54,7 @@ static bool running = true;
 #endif
 
 static void *decode_thread(void *vargp) {
+	(void)vargp;
 
 	while (running) {
 		size_t bytes, space, min_space;

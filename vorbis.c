@@ -163,6 +163,10 @@ static decode_state vorbis_decode(void) {
 
 		v->opened = true;
 		info = OV(v, info, v->vf, -1);
+		if (!info || !info->rate || (info->channels != 1 && info->channels != 2)) {
+			LOG_WARN("unsupported Vorbis stream format");
+			return DECODE_ERROR;
+		}
 
 		LOG_INFO("setting track_start");
 		LOCK_O;
@@ -175,10 +179,6 @@ static decode_state vorbis_decode(void) {
 
 		channels = info->channels;
 
-		if (channels > 2) {
-			LOG_WARN("too many channels: %d", channels);
-			return DECODE_ERROR;
-		}
 	}
 	
 #if FRAME_BUF
