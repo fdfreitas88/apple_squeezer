@@ -21,7 +21,7 @@ PLAYER_NAME='AppleSqueezerIntelTest'
 PLAYER_MAC='02:41:53:49:4e:54'
 OUTPUT_DEVICE=${APPLE_SQUEEZER_DEVICE:-}
 LMS_SERVER='127.0.0.1'
-AUDIO_MODE=${APPLE_SQUEEZER_MODE:-bitperfect}
+AUDIO_MODE=${APPLE_SQUEEZER_MODE:-native}
 
 usage() {
 	cat <<'EOF'
@@ -54,7 +54,7 @@ Target: musicplayer@10.73.254.20
 Override only when necessary with MUSICPLAYER_SSH=user@host.
 Select dac-priority, equalizer, osf, csf, native, bitperfect, exclusive,
 audiophile, or pcm-studio with --mode or
-APPLE_SQUEEZER_MODE (default: bitperfect). Exclusive modes cannot share the
+APPLE_SQUEEZER_MODE (default: native). Exclusive modes cannot share the
 Mojo with the standard LocalPlayer instance.
 The CoreAudio device defaults to "default". Override it with --device or
 APPLE_SQUEEZER_DEVICE. The selected device is persisted on Musicplayer.

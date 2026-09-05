@@ -148,7 +148,7 @@ unexplained underrun; measurements and known limitations ship with the RC.
 1. `Apple Squeezer Intel v1.0-dev`: C1 foundation and test harness.
 2. `Apple Squeezer Intel v1.0-alpha`: C2 native EQ, opt-in through local configuration.
 3. `Apple Squeezer Intel v1.0-beta`: C3–C5 engine complete and exposed in Echo Classic.
-4. `Apple Squeezer Intel v1.0-rc2`: current release candidate; C6 migration plus
+4. `Apple Squeezer Intel v1.0-rc3`: current release candidate; C6 migration plus
    C7 automated and Mojo validation must be complete before publication.
 5. `Apple Squeezer Intel v1.0`: only after rollback, licensing, stability, and
    listening/measurement acceptance are signed off.

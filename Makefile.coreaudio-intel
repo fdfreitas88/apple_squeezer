@@ -10,7 +10,7 @@ SOXR_BUILD = third_party/soxr/build-intel
 SOXR_LIBRARY = $(SOXR_BUILD)/src/libsoxr.a
 
 OPTS = -DCOREAUDIO -DDSD -DALAC -DRESAMPLE -DDSP -DLINKALL -DNO_FAAD -DNO_MAD -DNO_MPG123 -DNO_VORBIS \
-	-DMODEL_NAME=AppleSqueezerIntel -DCUSTOM_VERSION=-apple-squeezer-intel-v1.0-rc2
+	-DMODEL_NAME=AppleSqueezerIntel -DCUSTOM_VERSION=-apple-squeezer-intel-v1.0-rc3
 
 CFLAGS = -arch x86_64 -mmacosx-version-min=11.0 -Wall -Wextra -fPIC -O2 \
 	-Ithird_party/flac/include -Ithird_party/alac/codec -Ithird_party/soxr/src

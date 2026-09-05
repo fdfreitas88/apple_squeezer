@@ -5,6 +5,7 @@
  */
 
 #include "squeezelite.h"
+#include "pcm_convert.h"
 
 #if COREAUDIO
 
@@ -23,7 +24,19 @@ static AudioDeviceID audio_device;
 static unsigned device_rate;
 static u8_t *write_ptr;
 static bool ca_exclusive;
+static bool ca_float_client;
 static bool ca_bitperfect;
+/* the modes requested on the command line; ca_exclusive/ca_float_client/ca_bitperfect are the
+ * ones in effect for the current open and may have been relaxed by the shared fallback */
+static bool ca_req_exclusive;
+static bool ca_req_float_client;
+static bool ca_req_bitperfect;
+static bool ca_allow_fallback = true;
+static bool ca_fallback_active;
+/* consecutive failed opens and when the last one failed: the monitor backs off instead of
+ * retrying every 200 ms (28k "unable to open" lines in two hours on 2026-09-01) */
+static unsigned ca_open_failures;
+static u32_t ca_open_fail_ms;
 static bool ca_dither;
 static bool ca_hogged;
 static bool ca_listeners_installed;
@@ -377,25 +390,41 @@ static void ca_measure_latency(void) {
 		device_latency, safety, buffer_frames, unit_latency * 1000.0, pipeline);
 }
 
+/* 1 s after the first failed open, doubling up to a 30 s ceiling */
+static u32_t ca_retry_delay_ms(unsigned failures) {
+	unsigned shift = failures ? failures - 1 : 0;
+	u32_t delay;
+	if (shift > 5) shift = 5;
+	delay = 1000U << shift;
+	return delay > 30000U ? 30000U : delay;
+}
+
 static void *ca_monitor(void *unused) {
 	(void)unused;
 	while (__atomic_load_n(&ca_monitor_running, __ATOMIC_ACQUIRE)) {
 		if (__atomic_exchange_n(&ca_wake_deferred, false, __ATOMIC_ACQ_REL)) wake_controller();
-		if (__atomic_load_n(&output.error_opening, __ATOMIC_ACQUIRE) ||
-				__atomic_exchange_n(&ca_device_changed, false, __ATOMIC_ACQ_REL)) {
-			__atomic_store_n(&output.coreaudio_reopen, true, __ATOMIC_RELEASE);
-			wake_controller();
+		{
+			bool changed = __atomic_exchange_n(&ca_device_changed, false, __ATOMIC_ACQ_REL);
+			bool failed = __atomic_load_n(&output.error_opening, __ATOMIC_ACQUIRE);
+			/* a device change is new information: retry at once and restart the backoff */
+			if (changed) __atomic_store_n(&ca_open_failures, 0U, __ATOMIC_RELEASE);
+			if (changed || (failed && gettime_ms() - __atomic_load_n(&ca_open_fail_ms, __ATOMIC_ACQUIRE) >=
+					ca_retry_delay_ms(__atomic_load_n(&ca_open_failures, __ATOMIC_ACQUIRE)))) {
+				__atomic_store_n(&output.coreaudio_reopen, true, __ATOMIC_RELEASE);
+				wake_controller();
+			}
 		}
 		{
 			u32_t now = gettime_ms();
 			if (now - ca_last_telemetry_log >= 10000) {
-				LOG_INFO("CoreAudio telemetry: mode=%s rate=%u buffer=%u latency=%u underruns=%u overloads=%u reopens=%u processed=%llu clipped=%llu physical=%s volume=%s exclusive=%s",
+				LOG_INFO("CoreAudio telemetry: mode=%s rate=%u buffer=%u latency=%u underruns=%u overloads=%u reopens=%u processed=%llu clipped=%llu physical=%s volume=%s exclusive=%s fallback=%s",
 					ca_mode, __atomic_load_n(&device_rate, __ATOMIC_ACQUIRE), __atomic_load_n(&ca_buffer_frames, __ATOMIC_ACQUIRE), __atomic_load_n(&ca_pipeline_frames, __ATOMIC_ACQUIRE),
 					__atomic_load_n(&ca_underruns, __ATOMIC_RELAXED), __atomic_load_n(&ca_overloads, __ATOMIC_RELAXED), __atomic_load_n(&ca_reopens, __ATOMIC_RELAXED),
 					(unsigned long long)__atomic_load_n(&ca_processed_frames, __ATOMIC_RELAXED),
 					(unsigned long long)__atomic_load_n(&ca_clipped_samples, __ATOMIC_RELAXED),
 					__atomic_load_n(&ca_physical_verified,__ATOMIC_ACQUIRE)?"verified":"unverified", __atomic_load_n(&ca_volume_verified,__ATOMIC_ACQUIRE)?"verified":"unverified",
-					__atomic_load_n(&ca_exclusive_verified,__ATOMIC_ACQUIRE)?"verified":"not-requested");
+					__atomic_load_n(&ca_exclusive_verified,__ATOMIC_ACQUIRE)?"verified":"not-requested",
+					__atomic_load_n(&ca_fallback_active,__ATOMIC_ACQUIRE)?"shared":"none");
 				ca_last_telemetry_log = now;
 			}
 		}
@@ -611,7 +640,14 @@ static int ca_write_frames(frames_t frames, bool silence, s32_t gainL, s32_t gai
 		if (ca_dither) ca_apply_tpdf_24((s32_t *)outputbuf->readp, frames);
 #endif
 		__atomic_add_fetch(&ca_processed_frames, frames, __ATOMIC_RELAXED);
-		memcpy(write_ptr, outputbuf->readp, frames * BYTES_PER_FRAME);
+		if (ca_float_client) {
+			const u32_t *source = (const u32_t *)outputbuf->readp;
+			float *destination = (float *)write_ptr;
+			uint64_t samples = (uint64_t)frames * 2U;
+			while (samples--) *destination++ = pcm_s32_to_float(*source++);
+		} else {
+			memcpy(write_ptr, outputbuf->readp, frames * BYTES_PER_FRAME);
+		}
 	} else {
 		u8_t *buffer = silencebuf;
 		IF_DSD(
@@ -707,15 +743,23 @@ void _coreaudio_open(void) {
 	AURenderCallbackStruct callback = { ca_render, NULL };
 	AudioComponent component;
 	OSStatus status;
+	bool found = false;
 	ca_dispose();
 	__atomic_store_n(&ca_physical_verified, false, __ATOMIC_RELEASE);
 	__atomic_store_n(&ca_volume_verified, false, __ATOMIC_RELEASE);
 	__atomic_store_n(&ca_exclusive_verified, false, __ATOMIC_RELEASE);
+	/* every open starts from the requested mode; a fallback applies to this open only */
+	ca_exclusive = ca_req_exclusive;
+	ca_float_client = ca_req_float_client;
+	ca_bitperfect = ca_req_bitperfect;
+	__atomic_store_n(&ca_fallback_active, false, __ATOMIC_RELEASE);
 	if (output.state == OUTPUT_OFF) return;
 	__atomic_add_fetch(&ca_reopens, 1U, __ATOMIC_RELAXED);
+retry:
 	audio_device = ca_find_device(output.device);
 	component = AudioComponentFindNext(NULL, &description);
 	if (!component || audio_device == kAudioObjectUnknown) goto failed;
+	found = true;
 	ca_snapshot_device_state(audio_device);
 	if (ca_exclusive && !ca_acquire_hog(audio_device)) {
 		LOG_ERROR("unable to acquire exclusive access to CoreAudio device %u", (unsigned)audio_device);
@@ -735,7 +779,8 @@ void _coreaudio_open(void) {
 	if (AudioUnitSetProperty(audio_unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &audio_device, sizeof(audio_device)) != noErr) goto failed;
 	format.mSampleRate = output.current_sample_rate;
 	format.mFormatID = kAudioFormatLinearPCM;
-	format.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked | kAudioFormatFlagsNativeEndian;
+	format.mFormatFlags = (ca_float_client ? kAudioFormatFlagIsFloat : kAudioFormatFlagIsSignedInteger) |
+		kAudioFormatFlagIsPacked | kAudioFormatFlagsNativeEndian;
 	format.mBytesPerPacket = BYTES_PER_FRAME;
 	format.mFramesPerPacket = 1;
 	format.mBytesPerFrame = BYTES_PER_FRAME;
@@ -750,7 +795,8 @@ void _coreaudio_open(void) {
 				actual.mSampleRate + 0.5 < format.mSampleRate || actual.mSampleRate - 0.5 > format.mSampleRate ||
 				actual.mChannelsPerFrame != 2 || actual.mBitsPerChannel != 32 ||
 				actual.mBytesPerFrame != BYTES_PER_FRAME ||
-				!(actual.mFormatFlags & kAudioFormatFlagIsSignedInteger) ||
+				(ca_float_client ? !(actual.mFormatFlags & kAudioFormatFlagIsFloat) :
+					!(actual.mFormatFlags & kAudioFormatFlagIsSignedInteger)) ||
 				!(actual.mFormatFlags & kAudioFormatFlagIsPacked) ||
 				(actual.mFormatFlags & kAudioFormatFlagIsNonInterleaved)) {
 			LOG_ERROR("CoreAudio AUHAL client stream format verification failed");
@@ -770,8 +816,12 @@ void _coreaudio_open(void) {
 	ca_add_listeners();
 	__atomic_store_n(&output.error_opening, false, __ATOMIC_RELEASE);
 	__atomic_store_n(&ca_device_changed, false, __ATOMIC_RELEASE);
-	LOG_INFO("signal path: mode=%s -> S32 %s%s -> CoreAudio %u Hz -> device %u%s",
-		ca_mode, ca_transport(), ca_dither ? " + TPDF24" : "", output.current_sample_rate,
+	__atomic_store_n(&ca_open_failures, 0U, __ATOMIC_RELEASE);
+	if (__atomic_load_n(&ca_fallback_active, __ATOMIC_ACQUIRE))
+		LOG_WARN("running in shared fallback mode on device %u: not bit-perfect, hardware volume active", (unsigned)audio_device);
+	LOG_INFO("signal path: mode=%s -> S32 %s%s -> %s -> CoreAudio %u Hz -> device %u%s",
+		ca_mode, ca_transport(), ca_dither ? " + TPDF24" : "",
+		ca_float_client ? "Float32 shared mixer" : "S32 direct", output.current_sample_rate,
 		(unsigned)audio_device, ca_bitperfect ? " [bit-perfect]" : "");
 	LOG_INFO("opened CoreAudio device %u: requested=%u Hz hardware=%u Hz profile=%s%s%s",
 		(unsigned)audio_device, output.current_sample_rate, __atomic_load_n(&device_rate, __ATOMIC_ACQUIRE),
@@ -779,14 +829,34 @@ void _coreaudio_open(void) {
 	return;
 failed:
 	ca_dispose();
+	if (found && ca_allow_fallback && !__atomic_load_n(&ca_fallback_active, __ATOMIC_ACQUIRE) && (ca_exclusive || ca_bitperfect)) {
+		/* the device exists but cannot be hogged or does not offer an integer bit-perfect stream:
+		 * playing through the shared mixer beats silence plus a restart loop. 'strict' disables this. */
+		LOG_WARN("exclusive/bit-perfect output is not available on this device - falling back to shared Float32 output (add 'strict' to the -a parameters to disable this fallback)");
+		__atomic_store_n(&ca_fallback_active, true, __ATOMIC_RELEASE);
+		ca_exclusive = false;
+		ca_float_client = true;
+		ca_bitperfect = false;
+		goto retry;
+	}
 	__atomic_store_n(&output.error_opening, true, __ATOMIC_RELEASE);
-	LOG_ERROR("unable to open CoreAudio output");
+	/* a failed open must not leave the flags of its partial progress in the telemetry */
+	__atomic_store_n(&ca_physical_verified, false, __ATOMIC_RELEASE);
+	__atomic_store_n(&ca_volume_verified, false, __ATOMIC_RELEASE);
+	__atomic_store_n(&ca_exclusive_verified, false, __ATOMIC_RELEASE);
+	{
+		unsigned failures = __atomic_add_fetch(&ca_open_failures, 1U, __ATOMIC_ACQ_REL);
+		__atomic_store_n(&ca_open_fail_ms, gettime_ms(), __ATOMIC_RELEASE);
+		if (failures == 1) LOG_ERROR("unable to open CoreAudio output");
+		else LOG_INFO("unable to open CoreAudio output (attempt %u, next retry in %u s)", failures, ca_retry_delay_ms(failures) / 1000U);
+	}
 }
 
 void output_init_coreaudio(log_level level, const char *device, unsigned output_buf_size, char *params,
 		unsigned rates[], unsigned rate_delay, unsigned idle) {
 	loglevel = level;
 	ca_exclusive = ca_param_enabled(params, "exclusive");
+	ca_float_client = !ca_exclusive;
 	ca_bitperfect = ca_param_enabled(params, "bitperfect");
 	ca_dither = ca_param_enabled(params, "dither");
 	const char *mode = ca_param_value(params, "mode");
@@ -807,12 +877,15 @@ void output_init_coreaudio(log_level level, const char *device, unsigned output_
 	ca_headroom_gain = to_gain((float)pow(10.0, -ca_headroom_db / 20.0));
 	if (!strcmp(ca_mode, "pcm-studio")) ca_dither = true;
 	if (ca_bitperfect) {
-		if (!ca_exclusive) LOG_WARN("bit-perfect mode requires exclusive access; enabling it");
-		ca_exclusive = true;
+		if (!ca_exclusive) LOG_INFO("bit-perfect processing requested with shared CoreAudio access");
 		ca_dither = false;
 		ca_headroom_db = 0.0;
 		ca_headroom_gain = FIXED_ONE;
 	}
+	ca_allow_fallback = !ca_param_enabled(params, "strict");
+	ca_req_exclusive = ca_exclusive;
+	ca_req_float_client = ca_float_client;
+	ca_req_bitperfect = ca_bitperfect;
 	const char *profile = ca_param_value(params, "profile");
 	if (profile && (!strcmp(profile, "safe") || !strcmp(profile, "balanced") || !strcmp(profile, "lowlatency"))) {
 		ca_profile = !strcmp(profile, "safe") ? "safe" : !strcmp(profile, "lowlatency") ? "lowlatency" : "balanced";

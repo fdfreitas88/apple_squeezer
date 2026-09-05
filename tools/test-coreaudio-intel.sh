@@ -222,7 +222,10 @@ start_candidate() {
 		[ -z "$configured_dsp" ] || set -- "$@" -Q "@$configured_dsp"
 	fi
 	[ -z "$resample_params" ] || set -- "$@" -u "$resample_params"
-	set -- "$@" -D 0:dop -f "$LOG_FILE" -d all=info
+	case "$configured_playback_mode" in
+		dac-priority|exclusive|audiophile) set -- "$@" -D 0:dop ;;
+	esac
+	set -- "$@" -f "$LOG_FILE" -d all=info
 	nohup "$INSTALL_BIN" "$@" >/dev/null 2>&1 &
 	pid=$!
 	printf '%s\n' "$pid" > "$PID_FILE"
@@ -302,13 +305,13 @@ parse_install_options() {
 	esac
 	case "$AUDIO_MODE" in
 		dac-priority) AUDIO_PARAMS="mode=native:exclusive:bitperfect:profile=safe" ;;
-		equalizer) AUDIO_PARAMS="mode=native:exclusive:profile=safe" ;;
-		osf|csf) AUDIO_PARAMS="mode=pcm-studio:exclusive:dither:headroom=1:profile=safe" ;;
+		equalizer) AUDIO_PARAMS="mode=native:profile=safe" ;;
+		osf|csf) AUDIO_PARAMS="mode=pcm-studio:dither:headroom=1:profile=safe" ;;
 		native) AUDIO_PARAMS="mode=native:profile=balanced" ;;
 		bitperfect) AUDIO_PARAMS="mode=native:bitperfect:profile=balanced" ;;
 		exclusive) AUDIO_PARAMS="mode=native:exclusive:profile=balanced" ;;
 		audiophile) AUDIO_PARAMS="mode=native:exclusive:bitperfect:profile=safe" ;;
-		pcm-studio) AUDIO_PARAMS="mode=pcm-studio:exclusive:dither:headroom=1:profile=safe" ;;
+		pcm-studio) AUDIO_PARAMS="mode=pcm-studio:dither:headroom=1:profile=safe" ;;
 		*) fail "invalid --mode value: $AUDIO_MODE" ;;
 	esac
 }
@@ -644,13 +647,13 @@ set_audio_mode() {
 	[ "$#" -eq 1 ] || fail "mode requires dac-priority, equalizer, osf, csf, native, bitperfect, exclusive, audiophile, or pcm-studio"
 	case "$1" in
 		dac-priority) audio_params="mode=native:exclusive:bitperfect:profile=safe" ;;
-		equalizer) audio_params="mode=native:exclusive:profile=safe" ;;
-		osf|csf) audio_params="mode=pcm-studio:exclusive:dither:headroom=1:profile=safe" ;;
+		equalizer) audio_params="mode=native:profile=safe" ;;
+		osf|csf) audio_params="mode=pcm-studio:dither:headroom=1:profile=safe" ;;
 		native) audio_params="mode=native:profile=balanced" ;;
 		bitperfect) audio_params="mode=native:bitperfect:profile=balanced" ;;
 		exclusive) audio_params="mode=native:exclusive:profile=balanced" ;;
 		audiophile) audio_params="mode=native:exclusive:bitperfect:profile=safe" ;;
-		pcm-studio) audio_params="mode=pcm-studio:exclusive:dither:headroom=1:profile=safe" ;;
+		pcm-studio) audio_params="mode=pcm-studio:dither:headroom=1:profile=safe" ;;
 		*) fail "invalid mode: $1" ;;
 	esac
 	[ -x "$INSTALL_BIN" ] || fail "candidate is not installed"

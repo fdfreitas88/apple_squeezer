@@ -1,8 +1,8 @@
-# Apple Squeezer Intel v1.0-rc2
+# Apple Squeezer Intel v1.0-rc3
 
-The product release name is **Apple Squeezer Intel v1.0-rc2**. LMS firmware
+The product release name is **Apple Squeezer Intel v1.0-rc3**. LMS firmware
 reporting retains the underlying Squeezelite protocol/source revision and adds
-the product version suffix: `2.0-1595-apple-squeezer-intel-v1.0-rc2`.
+the product version suffix: `2.0-1595-apple-squeezer-intel-v1.0-rc3`.
 
 This candidate tracks upstream Squeezelite revision 1595 and replaces the
 PortAudio output path with Apple's AUHAL/CoreAudio APIs. It targets x86_64
@@ -61,7 +61,7 @@ The deployment manager exposes five modes:
   balanced buffer.
 - `exclusive`: CoreAudio hog mode, balanced buffer.
 - `audiophile`: fixed-volume plus hog mode, strict format checks, safe buffer.
-- `pcm-studio`: VHQ linear-phase upsampling, exclusive access, 1 dB
+- `pcm-studio`: VHQ linear-phase upsampling, shared access by default, 1 dB
   processing headroom, 24-bit TPDF dither, and a safe buffer.
 
 PCM Studio uses the pinned, statically linked libsoxr engine at 28-bit

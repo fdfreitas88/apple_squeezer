@@ -1,8 +1,14 @@
-# Apple Squeezer Intel v1.0-rc2
+# Apple Squeezer Intel v1.0-rc3
 
 Apple Squeezer is an Intel macOS build of Squeezelite using Apple's native
 CoreAudio AUHAL output path. The release candidate targets x86_64 Macs running
 macOS 11 or newer and is based on upstream Squeezelite revision 1595.
+
+RC3 fixes big-endian PCM conversion coverage and separates CoreAudio's shared
+and exclusive signal paths. Shared playback now converts the internal S32
+stream explicitly to Float32 for the macOS mixer; exclusive playback retains
+direct S32 PCM and DoP transport. It also fixes playback failing to restart
+after CoreAudio entered its idle/off state.
 
 This is a pre-release test candidate. It is not signed or notarized. Physical
 Chord Mojo qualification passed at 44.1, 48, 88.2, 96, 176.4, and 192 kHz,

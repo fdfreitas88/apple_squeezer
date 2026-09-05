@@ -425,8 +425,20 @@ void output_init_common(log_level level, const char *device, unsigned output_buf
 	}
 	else {
 		if (!test_open(output.device, output.supported_rates, user_rates)) {
+#if COREAUDIO
+			/* exiting here made the LMS plugin restart the player every few seconds for as long
+			 * as the device stayed unavailable (462 starts on 2026-09-01/02). Stay up with a
+			 * conservative rate list and let the CoreAudio monitor retry the open with backoff. */
+			static const unsigned fallback_rates[] = { 192000, 176400, 96000, 88200, 48000, 44100 };
+			LOG_ERROR("output device not available at startup: %s - advertising up to 192 kHz and retrying in the background", output.device);
+			for (i = 0; i < MAX_SUPPORTED_SAMPLERATES; ++i) {
+				output.supported_rates[i] = i < sizeof(fallback_rates) / sizeof(fallback_rates[0]) ? fallback_rates[i] : 0;
+			}
+			output.error_opening = true;
+#else
 			LOG_ERROR("unable to open output device: %s", output.device);
 			exit(1);
+#endif
 		}
 	}
 

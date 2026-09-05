@@ -1,0 +1,236 @@
+--- /private/tmp/claude-502/-Users-felipefreitas-Desktop-Claude-LMS-Audiophile-Squeezelite/91dbf08e-66b6-4e49-88f3-55b8924a6a1d/scratchpad/engine-bak/output_coreaudio.c	2026-09-05 09:16:35
++++ output_coreaudio.c	2026-09-05 09:33:43
+@@ -26,6 +26,17 @@
+ static bool ca_exclusive;
+ static bool ca_float_client;
+ static bool ca_bitperfect;
++/* the modes requested on the command line; ca_exclusive/ca_float_client/ca_bitperfect are the
++ * ones in effect for the current open and may have been relaxed by the shared fallback */
++static bool ca_req_exclusive;
++static bool ca_req_float_client;
++static bool ca_req_bitperfect;
++static bool ca_allow_fallback = true;
++static bool ca_fallback_active;
++/* consecutive failed opens and when the last one failed: the monitor backs off instead of
++ * retrying every 200 ms (28k "unable to open" lines in two hours on 2026-09-01) */
++static unsigned ca_open_failures;
++static u32_t ca_open_fail_ms;
+ static bool ca_dither;
+ static bool ca_hogged;
+ static bool ca_listeners_installed;
+@@ -379,25 +390,41 @@
+ 		device_latency, safety, buffer_frames, unit_latency * 1000.0, pipeline);
+ }
+ 
++/* 1 s after the first failed open, doubling up to a 30 s ceiling */
++static u32_t ca_retry_delay_ms(unsigned failures) {
++	unsigned shift = failures ? failures - 1 : 0;
++	u32_t delay;
++	if (shift > 5) shift = 5;
++	delay = 1000U << shift;
++	return delay > 30000U ? 30000U : delay;
++}
++
+ static void *ca_monitor(void *unused) {
+ 	(void)unused;
+ 	while (__atomic_load_n(&ca_monitor_running, __ATOMIC_ACQUIRE)) {
+ 		if (__atomic_exchange_n(&ca_wake_deferred, false, __ATOMIC_ACQ_REL)) wake_controller();
+-		if (__atomic_load_n(&output.error_opening, __ATOMIC_ACQUIRE) ||
+-				__atomic_exchange_n(&ca_device_changed, false, __ATOMIC_ACQ_REL)) {
+-			__atomic_store_n(&output.coreaudio_reopen, true, __ATOMIC_RELEASE);
+-			wake_controller();
++		{
++			bool changed = __atomic_exchange_n(&ca_device_changed, false, __ATOMIC_ACQ_REL);
++			bool failed = __atomic_load_n(&output.error_opening, __ATOMIC_ACQUIRE);
++			/* a device change is new information: retry at once and restart the backoff */
++			if (changed) __atomic_store_n(&ca_open_failures, 0U, __ATOMIC_RELEASE);
++			if (changed || (failed && gettime_ms() - __atomic_load_n(&ca_open_fail_ms, __ATOMIC_ACQUIRE) >=
++					ca_retry_delay_ms(__atomic_load_n(&ca_open_failures, __ATOMIC_ACQUIRE)))) {
++				__atomic_store_n(&output.coreaudio_reopen, true, __ATOMIC_RELEASE);
++				wake_controller();
++			}
+ 		}
+ 		{
+ 			u32_t now = gettime_ms();
+ 			if (now - ca_last_telemetry_log >= 10000) {
+-				LOG_INFO("CoreAudio telemetry: mode=%s rate=%u buffer=%u latency=%u underruns=%u overloads=%u reopens=%u processed=%llu clipped=%llu physical=%s volume=%s exclusive=%s",
++				LOG_INFO("CoreAudio telemetry: mode=%s rate=%u buffer=%u latency=%u underruns=%u overloads=%u reopens=%u processed=%llu clipped=%llu physical=%s volume=%s exclusive=%s fallback=%s",
+ 					ca_mode, __atomic_load_n(&device_rate, __ATOMIC_ACQUIRE), __atomic_load_n(&ca_buffer_frames, __ATOMIC_ACQUIRE), __atomic_load_n(&ca_pipeline_frames, __ATOMIC_ACQUIRE),
+ 					__atomic_load_n(&ca_underruns, __ATOMIC_RELAXED), __atomic_load_n(&ca_overloads, __ATOMIC_RELAXED), __atomic_load_n(&ca_reopens, __ATOMIC_RELAXED),
+ 					(unsigned long long)__atomic_load_n(&ca_processed_frames, __ATOMIC_RELAXED),
+ 					(unsigned long long)__atomic_load_n(&ca_clipped_samples, __ATOMIC_RELAXED),
+ 					__atomic_load_n(&ca_physical_verified,__ATOMIC_ACQUIRE)?"verified":"unverified", __atomic_load_n(&ca_volume_verified,__ATOMIC_ACQUIRE)?"verified":"unverified",
+-					__atomic_load_n(&ca_exclusive_verified,__ATOMIC_ACQUIRE)?"verified":"not-requested");
++					__atomic_load_n(&ca_exclusive_verified,__ATOMIC_ACQUIRE)?"verified":"not-requested",
++					__atomic_load_n(&ca_fallback_active,__ATOMIC_ACQUIRE)?"shared":"none");
+ 				ca_last_telemetry_log = now;
+ 			}
+ 		}
+@@ -716,15 +743,23 @@
+ 	AURenderCallbackStruct callback = { ca_render, NULL };
+ 	AudioComponent component;
+ 	OSStatus status;
++	bool found = false;
+ 	ca_dispose();
+ 	__atomic_store_n(&ca_physical_verified, false, __ATOMIC_RELEASE);
+ 	__atomic_store_n(&ca_volume_verified, false, __ATOMIC_RELEASE);
+ 	__atomic_store_n(&ca_exclusive_verified, false, __ATOMIC_RELEASE);
++	/* every open starts from the requested mode; a fallback applies to this open only */
++	ca_exclusive = ca_req_exclusive;
++	ca_float_client = ca_req_float_client;
++	ca_bitperfect = ca_req_bitperfect;
++	__atomic_store_n(&ca_fallback_active, false, __ATOMIC_RELEASE);
+ 	if (output.state == OUTPUT_OFF) return;
+ 	__atomic_add_fetch(&ca_reopens, 1U, __ATOMIC_RELAXED);
++retry:
+ 	audio_device = ca_find_device(output.device);
+ 	component = AudioComponentFindNext(NULL, &description);
+ 	if (!component || audio_device == kAudioObjectUnknown) goto failed;
++	found = true;
+ 	ca_snapshot_device_state(audio_device);
+ 	if (ca_exclusive && !ca_acquire_hog(audio_device)) {
+ 		LOG_ERROR("unable to acquire exclusive access to CoreAudio device %u", (unsigned)audio_device);
+@@ -781,6 +816,9 @@
+ 	ca_add_listeners();
+ 	__atomic_store_n(&output.error_opening, false, __ATOMIC_RELEASE);
+ 	__atomic_store_n(&ca_device_changed, false, __ATOMIC_RELEASE);
++	__atomic_store_n(&ca_open_failures, 0U, __ATOMIC_RELEASE);
++	if (__atomic_load_n(&ca_fallback_active, __ATOMIC_ACQUIRE))
++		LOG_WARN("running in shared fallback mode on device %u: not bit-perfect, hardware volume active", (unsigned)audio_device);
+ 	LOG_INFO("signal path: mode=%s -> S32 %s%s -> %s -> CoreAudio %u Hz -> device %u%s",
+ 		ca_mode, ca_transport(), ca_dither ? " + TPDF24" : "",
+ 		ca_float_client ? "Float32 shared mixer" : "S32 direct", output.current_sample_rate,
+@@ -791,8 +829,27 @@
+ 	return;
+ failed:
+ 	ca_dispose();
++	if (found && ca_allow_fallback && !__atomic_load_n(&ca_fallback_active, __ATOMIC_ACQUIRE) && (ca_exclusive || ca_bitperfect)) {
++		/* the device exists but cannot be hogged or does not offer an integer bit-perfect stream:
++		 * playing through the shared mixer beats silence plus a restart loop. 'strict' disables this. */
++		LOG_WARN("exclusive/bit-perfect output is not available on this device - falling back to shared Float32 output (add 'strict' to the -a parameters to disable this fallback)");
++		__atomic_store_n(&ca_fallback_active, true, __ATOMIC_RELEASE);
++		ca_exclusive = false;
++		ca_float_client = true;
++		ca_bitperfect = false;
++		goto retry;
++	}
+ 	__atomic_store_n(&output.error_opening, true, __ATOMIC_RELEASE);
+-	LOG_ERROR("unable to open CoreAudio output");
++	/* a failed open must not leave the flags of its partial progress in the telemetry */
++	__atomic_store_n(&ca_physical_verified, false, __ATOMIC_RELEASE);
++	__atomic_store_n(&ca_volume_verified, false, __ATOMIC_RELEASE);
++	__atomic_store_n(&ca_exclusive_verified, false, __ATOMIC_RELEASE);
++	{
++		unsigned failures = __atomic_add_fetch(&ca_open_failures, 1U, __ATOMIC_ACQ_REL);
++		__atomic_store_n(&ca_open_fail_ms, gettime_ms(), __ATOMIC_RELEASE);
++		if (failures == 1) LOG_ERROR("unable to open CoreAudio output");
++		else LOG_INFO("unable to open CoreAudio output (attempt %u, next retry in %u s)", failures, ca_retry_delay_ms(failures) / 1000U);
++	}
+ }
+ 
+ void output_init_coreaudio(log_level level, const char *device, unsigned output_buf_size, char *params,
+@@ -825,6 +882,10 @@
+ 		ca_headroom_db = 0.0;
+ 		ca_headroom_gain = FIXED_ONE;
+ 	}
++	ca_allow_fallback = !ca_param_enabled(params, "strict");
++	ca_req_exclusive = ca_exclusive;
++	ca_req_float_client = ca_float_client;
++	ca_req_bitperfect = ca_bitperfect;
+ 	const char *profile = ca_param_value(params, "profile");
+ 	if (profile && (!strcmp(profile, "safe") || !strcmp(profile, "balanced") || !strcmp(profile, "lowlatency"))) {
+ 		ca_profile = !strcmp(profile, "safe") ? "safe" : !strcmp(profile, "lowlatency") ? "lowlatency" : "balanced";
+--- /private/tmp/claude-502/-Users-felipefreitas-Desktop-Claude-LMS-Audiophile-Squeezelite/91dbf08e-66b6-4e49-88f3-55b8924a6a1d/scratchpad/engine-bak/output.c	2026-09-05 09:16:35
++++ output.c	2026-09-05 09:16:35
+@@ -425,8 +425,20 @@
+ 	}
+ 	else {
+ 		if (!test_open(output.device, output.supported_rates, user_rates)) {
++#if COREAUDIO
++			/* exiting here made the LMS plugin restart the player every few seconds for as long
++			 * as the device stayed unavailable (462 starts on 2026-09-01/02). Stay up with a
++			 * conservative rate list and let the CoreAudio monitor retry the open with backoff. */
++			static const unsigned fallback_rates[] = { 192000, 176400, 96000, 88200, 48000, 44100 };
++			LOG_ERROR("output device not available at startup: %s - advertising up to 192 kHz and retrying in the background", output.device);
++			for (i = 0; i < MAX_SUPPORTED_SAMPLERATES; ++i) {
++				output.supported_rates[i] = i < sizeof(fallback_rates) / sizeof(fallback_rates[0]) ? fallback_rates[i] : 0;
++			}
++			output.error_opening = true;
++#else
+ 			LOG_ERROR("unable to open output device: %s", output.device);
+ 			exit(1);
++#endif
+ 		}
+ 	}
+ 
+--- /private/tmp/claude-502/-Users-felipefreitas-Desktop-Claude-LMS-Audiophile-Squeezelite/91dbf08e-66b6-4e49-88f3-55b8924a6a1d/scratchpad/engine-bak/alac.c	2026-09-05 09:50:14
++++ alac.c	2026-09-05 09:50:14
+@@ -64,7 +64,8 @@
+ 	u32_t  *block_size, default_block_size, block_index;
+ 	unsigned sample_rate;
+ 	unsigned char channels, sample_size;
+-	unsigned trak, play;
++	unsigned trak, play;	// streambuf fill level at the previous incomplete header pass (progress detection after EOF)
++	size_t header_used;
+ };
+ 
+ static struct alac *l;
+@@ -310,8 +311,11 @@
+ 				text[text_len] = '\0';
+ 				if (sscanf(text, "%x %x %x " FMT_x64, &b, &b, &c, &d) == 4) {
+ 					LOG_DEBUG("iTunSMPB start: %u end: %u samples: " FMT_u64, b, c, d);
+-					if (l->sttssamples && (d > l->sttssamples ||
+-						(u64_t)b + c > l->sttssamples - d)) {
++					// CoreAudio/afconvert writes stts already net of the trailing padding (stts == d):
++					// only treat stts as the padded total when it is smaller than the claimed count,
++					// otherwise the last 'c' frames of every ALAC track were cut and the final
++					// packet misplaced (verified bit-exact with the fake-LMS harness, 2026-09-05)
++					if (l->sttssamples && l->sttssamples < d) {
+ 						LOG_DEBUG("reducing samples as stts count is less");
+ 						d = (u64_t)b + c < l->sttssamples ? l->sttssamples - ((u64_t)b + c) : 0;
+ 					}
+@@ -380,6 +384,12 @@
+ 		_buf_inc_readp(streambuf, consume);
+ 		l->pos += consume;
+ 		l->consume -= consume;
++		if (l->consume && stream.state <= DISCONNECT && !_buf_used(streambuf)) {
++			// the skip points past the end of the stream: nothing more will arrive
++			LOG_WARN("stream ended with %u bytes still to skip", l->consume);
++			UNLOCK_S;
++			return DECODE_COMPLETE;
++		}
+ 		UNLOCK_S;
+ 		return DECODE_RUNNING;
+ 	}
+@@ -406,6 +416,18 @@
+ 			UNLOCK_S;
+ 			return DECODE_ERROR;
+ 		} else {
++			if (stream.state <= DISCONNECT) {
++				// no more data will arrive: if the parser made no progress since the last call
++				// (or the buffer is empty) the header can never complete and the decode thread
++				// must not spin on it. A single retry is still needed after _buf_unwrap.
++				size_t used = _buf_used(streambuf);
++				if (!used || used == l->header_used) {
++					LOG_WARN("stream ended inside the mp4 header");
++					UNLOCK_S;
++					return DECODE_ERROR;
++				}
++				l->header_used = used;
++			}
+ 			// not finished header parsing come back next time
+ 			UNLOCK_S;
+ 			return DECODE_RUNNING;
+@@ -432,6 +454,12 @@
+ 
+ 	// is there enough data for decoding
+ 	if (bytes < block_size) {
++		if (stream.state <= DISCONNECT) {
++			// truncated last block after the stream ended: the track must still finish
++			LOG_WARN("stream ended inside a block (%u of %u bytes)", (unsigned)bytes, block_size);
++			UNLOCK_S;
++			return DECODE_COMPLETE;
++		}
+ 		UNLOCK_S;
+ 		return DECODE_RUNNING;
+ 	} else l->block_index++;

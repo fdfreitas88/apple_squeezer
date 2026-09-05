@@ -64,7 +64,8 @@ struct alac {
 	u32_t  *block_size, default_block_size, block_index;
 	unsigned sample_rate;
 	unsigned char channels, sample_size;
-	unsigned trak, play;
+	unsigned trak, play;	// streambuf fill level at the previous incomplete header pass (progress detection after EOF)
+	size_t header_used;
 };
 
 static struct alac *l;
@@ -310,8 +311,11 @@ static int read_mp4_header(void) {
 				text[text_len] = '\0';
 				if (sscanf(text, "%x %x %x " FMT_x64, &b, &b, &c, &d) == 4) {
 					LOG_DEBUG("iTunSMPB start: %u end: %u samples: " FMT_u64, b, c, d);
-					if (l->sttssamples && (d > l->sttssamples ||
-						(u64_t)b + c > l->sttssamples - d)) {
+					// CoreAudio/afconvert writes stts already net of the trailing padding (stts == d):
+					// only treat stts as the padded total when it is smaller than the claimed count,
+					// otherwise the last 'c' frames of every ALAC track were cut and the final
+					// packet misplaced (verified bit-exact with the fake-LMS harness, 2026-09-05)
+					if (l->sttssamples && l->sttssamples < d) {
 						LOG_DEBUG("reducing samples as stts count is less");
 						d = (u64_t)b + c < l->sttssamples ? l->sttssamples - ((u64_t)b + c) : 0;
 					}
@@ -380,6 +384,12 @@ static decode_state alac_decode(void) {
 		_buf_inc_readp(streambuf, consume);
 		l->pos += consume;
 		l->consume -= consume;
+		if (l->consume && stream.state <= DISCONNECT && !_buf_used(streambuf)) {
+			// the skip points past the end of the stream: nothing more will arrive
+			LOG_WARN("stream ended with %u bytes still to skip", l->consume);
+			UNLOCK_S;
+			return DECODE_COMPLETE;
+		}
 		UNLOCK_S;
 		return DECODE_RUNNING;
 	}
@@ -406,6 +416,18 @@ static decode_state alac_decode(void) {
 			UNLOCK_S;
 			return DECODE_ERROR;
 		} else {
+			if (stream.state <= DISCONNECT) {
+				// no more data will arrive: if the parser made no progress since the last call
+				// (or the buffer is empty) the header can never complete and the decode thread
+				// must not spin on it. A single retry is still needed after _buf_unwrap.
+				size_t used = _buf_used(streambuf);
+				if (!used || used == l->header_used) {
+					LOG_WARN("stream ended inside the mp4 header");
+					UNLOCK_S;
+					return DECODE_ERROR;
+				}
+				l->header_used = used;
+			}
 			// not finished header parsing come back next time
 			UNLOCK_S;
 			return DECODE_RUNNING;
@@ -432,6 +454,12 @@ static decode_state alac_decode(void) {
 
 	// is there enough data for decoding
 	if (bytes < block_size) {
+		if (stream.state <= DISCONNECT) {
+			// truncated last block after the stream ended: the track must still finish
+			LOG_WARN("stream ended inside a block (%u of %u bytes)", (unsigned)bytes, block_size);
+			UNLOCK_S;
+			return DECODE_COMPLETE;
+		}
 		UNLOCK_S;
 		return DECODE_RUNNING;
 	} else l->block_index++;

@@ -739,18 +739,22 @@ static void slimproto_run() {
 				output.pa_reopen = false;
 			}
 #endif
+			if (_start_output && (output.state == OUTPUT_STOPPED || output.state == OUTPUT_OFF)) {
+				bool was_off = output.state == OUTPUT_OFF;
+				output.state = OUTPUT_BUFFER;
+				if (was_off) __atomic_store_n(&output.coreaudio_reopen, true, __ATOMIC_RELEASE);
+			}
 #if COREAUDIO
+			/* Process a reopen requested by the OUTPUT_OFF -> OUTPUT_BUFFER
+			 * transition in this same controller pass.  Doing this before the
+			 * transition left no Audio Unit callback to wake the controller for
+			 * a second pass, so playback remained in LMS waitingToPlay forever. */
 			if (__atomic_exchange_n(&output.coreaudio_reopen, false, __ATOMIC_ACQ_REL)) {
 				UNLOCK_O;
 				_coreaudio_open();
 				LOCK_O;
 			}
 #endif
-			if (_start_output && (output.state == OUTPUT_STOPPED || output.state == OUTPUT_OFF)) {
-				bool was_off = output.state == OUTPUT_OFF;
-				output.state = OUTPUT_BUFFER;
-				if (was_off) __atomic_store_n(&output.coreaudio_reopen, true, __ATOMIC_RELEASE);
-			}
 			if (output.state == OUTPUT_RUNNING && !sentSTMu && status.output_full == 0 && status.stream_state <= DISCONNECT &&
 				_decode_state == DECODE_STOPPED) {
 
