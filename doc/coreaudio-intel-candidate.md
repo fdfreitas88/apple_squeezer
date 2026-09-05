@@ -1,8 +1,8 @@
-# Apple Squeezer Intel v1.0-rc3
+# Apple Squeezer Intel v1.0-rc4
 
-The product release name is **Apple Squeezer Intel v1.0-rc3**. LMS firmware
+The product release name is **Apple Squeezer Intel v1.0-rc4**. LMS firmware
 reporting retains the underlying Squeezelite protocol/source revision and adds
-the product version suffix: `2.0-1595-apple-squeezer-intel-v1.0-rc3`.
+the product version suffix: `2.0-1595-apple-squeezer-intel-v1.0-rc4`.
 
 This candidate tracks upstream Squeezelite revision 1595 and replaces the
 PortAudio output path with Apple's AUHAL/CoreAudio APIs. It targets x86_64

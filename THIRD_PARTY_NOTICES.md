@@ -1,6 +1,6 @@
 # Third-party notices
 
-Apple Squeezer Intel v1.0-rc2 is derived from and statically links open-source
+Apple Squeezer Intel is derived from and statically links open-source
 software. The complete corresponding source, pinned submodule revisions, and
 build instructions are provided by this repository and release tag.
 

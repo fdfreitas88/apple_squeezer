@@ -1,19 +1,25 @@
-# Apple Squeezer Intel v1.0-rc3
+# Apple Squeezer Intel v1.0-rc4
 
 Apple Squeezer is an Intel macOS build of Squeezelite using Apple's native
 CoreAudio AUHAL output path. The release candidate targets x86_64 Macs running
 macOS 11 or newer and is based on upstream Squeezelite revision 1595.
 
-RC3 fixes big-endian PCM conversion coverage and separates CoreAudio's shared
-and exclusive signal paths. Shared playback now converts the internal S32
-stream explicitly to Float32 for the macOS mixer; exclusive playback retains
-direct S32 PCM and DoP transport. It also fixes playback failing to restart
-after CoreAudio entered its idle/off state.
+RC4 makes the CoreAudio open path survive real-world DAC behaviour. Hardware
+volume and mute are written only when they are not already at unity and before
+the stream starts (a control write during a running DoP stream mutes the Chord
+Mojo); a hardware-rate change that the driver accepts but does not apply is
+retried, then requested through the stream's physical format, and a refused
+rate names the other application holding the device instead of falling back to
+the shared mixer. The device is auto-selected by the LMS plugin, falls back to
+shared Float32 when exclusive bit-perfect output is impossible, and reopen
+retries back off from 1 s to 30 s. ALAC gapless playback no longer trims the
+last packet of CoreAudio-encoded files. See `doc/release-v1.0-rc4.md`.
 
-This is a pre-release test candidate. It is not signed or notarized. Physical
-Chord Mojo qualification passed at 44.1, 48, 88.2, 96, 176.4, and 192 kHz,
-including native DSD64/DoP at 176.4 kHz. The automated endurance fixture also
-processed audio without underruns, CoreAudio overloads, or clipped samples.
+This is a pre-release candidate. The binaries carry an ad-hoc code signature
+and are not notarized. Physical Chord Mojo qualification passed at 44.1, 48,
+88.2, 96, 176.4, and 192 kHz, including native DSD64/DoP at 176.4 kHz in the
+exclusive bit-perfect mode, with zero underruns, CoreAudio overloads, or
+clipped samples.
 
 The candidate provides native hardware-rate switching, physical stream-format
 verification, CoreAudio latency compensation and device recovery, exclusive

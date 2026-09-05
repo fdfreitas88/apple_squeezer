@@ -449,28 +449,121 @@ static void *ca_monitor(void *unused) {
 	return NULL;
 }
 
+static bool ca_rate_is(AudioDeviceID device, unsigned requested, Float64 *rate) {
+	UInt32 size = sizeof(*rate);
+	*rate = 0;
+	return ca_property(device, kAudioDevicePropertyNominalSampleRate,
+			kAudioObjectPropertyScopeGlobal, rate, &size) && *rate + 0.5 >= requested && *rate - 0.5 <= requested;
+}
+
+static bool ca_wait_rate(AudioDeviceID device, unsigned requested, Float64 *rate, unsigned ms) {
+	for (unsigned waited = 0; ; waited += 10) {
+		if (ca_rate_is(device, requested, rate)) return true;
+		if (waited >= ms) return false;
+		usleep(10000);
+	}
+}
+
+static bool ca_device_running_elsewhere(AudioDeviceID device) {
+	UInt32 running = 0, size = sizeof(running);
+	return ca_property(device, kAudioDevicePropertyDeviceIsRunningSomewhere,
+			kAudioObjectPropertyScopeGlobal, &running, &size) && running;
+}
+
+/* When a nominal-rate write is accepted but never applied, select a physical stream format at the
+ * requested rate directly; that is the route the HAL takes for a format change and some USB drivers
+ * honour it when they ignore the device-level request. Packed signed integer formats are preferred,
+ * widest first, because the bit-perfect verification accepts nothing else. */
+static bool ca_select_physical_rate(AudioDeviceID device, unsigned requested) {
+	AudioObjectPropertyAddress address = { kAudioDevicePropertyStreams,
+		kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain };
+	AudioObjectPropertyAddress available = { kAudioStreamPropertyAvailablePhysicalFormats,
+		kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+	AudioObjectPropertyAddress physical = { kAudioStreamPropertyPhysicalFormat,
+		kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+	UInt32 size = 0, count, i;
+	AudioStreamID *streams;
+	bool selected = false;
+	if (AudioObjectGetPropertyDataSize(device, &address, 0, NULL, &size) != noErr || !size) return false;
+	streams = malloc(size);
+	if (!streams) return false;
+	if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, streams) != noErr) { free(streams); return false; }
+	count = size / sizeof(*streams);
+	for (i = 0; i < count && !selected; ++i) {
+		AudioStreamRangedDescription *formats;
+		UInt32 fsize = 0, n, j;
+		int best = -1;
+		unsigned best_score = 0;
+		if (AudioObjectGetPropertyDataSize(streams[i], &available, 0, NULL, &fsize) != noErr || !fsize) continue;
+		formats = malloc(fsize);
+		if (!formats) continue;
+		if (AudioObjectGetPropertyData(streams[i], &available, 0, NULL, &fsize, formats) != noErr) { free(formats); continue; }
+		n = fsize / sizeof(*formats);
+		for (j = 0; j < n; ++j) {
+			const AudioStreamBasicDescription *f = &formats[j].mFormat;
+			bool exact = f->mSampleRate + 0.5 >= requested && f->mSampleRate - 0.5 <= requested;
+			bool ranged = f->mSampleRate == kAudioStreamAnyRate &&
+				formats[j].mSampleRateRange.mMinimum - 0.5 <= requested &&
+				formats[j].mSampleRateRange.mMaximum + 0.5 >= requested;
+			unsigned score;
+			if (f->mFormatID != kAudioFormatLinearPCM || f->mChannelsPerFrame != 2 || !(exact || ranged)) continue;
+			score = 1 + ((f->mFormatFlags & kAudioFormatFlagIsSignedInteger) ? 100 : 0) +
+				((f->mFormatFlags & kAudioFormatFlagIsPacked) ? 10 : 0) +
+				(f->mBitsPerChannel > 32 ? 32 : f->mBitsPerChannel) + (exact ? 1 : 0);
+			if (score > best_score) { best_score = score; best = (int)j; }
+		}
+		if (best >= 0) {
+			AudioStreamBasicDescription f = formats[best].mFormat;
+			f.mSampleRate = requested;
+			if (AudioObjectSetPropertyData(streams[i], &physical, 0, NULL, sizeof(f), &f) == noErr) {
+				LOG_INFO("CoreAudio physical format selected directly on stream %u: %u Hz, %u-bit, flags=0x%x",
+					(unsigned)streams[i], requested, f.mBitsPerChannel, (unsigned)f.mFormatFlags);
+				selected = true;
+			} else {
+				LOG_INFO("CoreAudio stream %u refused a direct physical format at %u Hz", (unsigned)streams[i], requested);
+			}
+		}
+		free(formats);
+	}
+	free(streams);
+	return selected;
+}
+
 static bool ca_set_nominal_rate(AudioDeviceID device, unsigned requested, unsigned *actual) {
-	Float64 rate = requested;
-	UInt32 size = sizeof(rate);
+	Float64 rate = requested, current = 0;
+	u32_t started = gettime_ms(), elapsed;
+	/* already there: no write at all. A pointless rate write reconfigures the USB interface and
+	 * some DACs click or mute on it. */
+	if (ca_rate_is(device, requested, &current)) {
+		*actual = requested;
+		ca_saved.changed_rate = false;
+		return true;
+	}
 	if (!ca_set_property(device, kAudioDevicePropertyNominalSampleRate,
 			kAudioObjectPropertyScopeGlobal, &rate, sizeof(rate))) {
 		LOG_ERROR("unable to set CoreAudio hardware rate to %u Hz", requested);
 		return false;
 	}
 	ca_saved.changed_rate = ca_saved.have_rate && fabs(ca_saved.rate - rate) > .5;
-	/* USB devices normally switch synchronously, but allow the HAL a short bounded settling period. */
-	for (unsigned attempt = 0; attempt < 20; ++attempt) {
-		size = sizeof(rate);
-		if (ca_property(device, kAudioDevicePropertyNominalSampleRate,
-				kAudioObjectPropertyScopeGlobal, &rate, &size) && rate + 0.5 >= requested && rate - 0.5 <= requested) {
-			*actual = (unsigned)(rate + 0.5);
-			return true;
-		}
-		usleep(10000);
-	}
-	*actual = (unsigned)(rate + 0.5);
-	LOG_ERROR("CoreAudio hardware rate mismatch: requested %u Hz, actual %u Hz", requested, *actual);
+	/* USB devices normally switch synchronously. Slow drivers get a bounded settle window, then
+	 * one repeated request, then a direct physical-format selection; on 2026-09-05 a 352.8 -> 44.1 kHz
+	 * change on a Chord Mojo was accepted and never applied through ten minutes of 30 s retries while
+	 * a second application held the device open. */
+	if (ca_wait_rate(device, requested, &current, 500)) goto done;
+	LOG_INFO("CoreAudio hardware rate is still %.0f Hz 500 ms after requesting %u Hz; repeating the request", current, requested);
+	(void)ca_set_property(device, kAudioDevicePropertyNominalSampleRate,
+		kAudioObjectPropertyScopeGlobal, &rate, sizeof(rate));
+	if (ca_wait_rate(device, requested, &current, 1000)) goto done;
+	if (ca_select_physical_rate(device, requested) && ca_wait_rate(device, requested, &current, 1000)) goto done;
+	*actual = (unsigned)(current + 0.5);
+	LOG_ERROR("CoreAudio hardware rate mismatch: requested %u Hz, actual %u Hz%s", requested, *actual,
+		ca_device_running_elsewhere(device) ? " (another application is running audio on this device; stop it or give this player its own DAC)" : "");
 	return false;
+done:
+	*actual = requested;
+	elapsed = gettime_ms() - started;
+	if (elapsed > 200) LOG_INFO("CoreAudio hardware rate %u Hz settled after %u ms", requested, (unsigned)elapsed);
+	return true;
 }
 
 static bool ca_acquire_hog(AudioDeviceID device) {
@@ -759,7 +852,7 @@ void _coreaudio_open(void) {
 	AURenderCallbackStruct callback = { ca_render, NULL };
 	AudioComponent component;
 	OSStatus status;
-	bool found = false;
+	bool found = false, rate_refused = false;
 	ca_dispose();
 	__atomic_store_n(&ca_physical_verified, false, __ATOMIC_RELEASE);
 	__atomic_store_n(&ca_volume_verified, false, __ATOMIC_RELEASE);
@@ -784,7 +877,7 @@ retry:
 	__atomic_store_n(&ca_exclusive_verified, ca_exclusive && ca_hogged, __ATOMIC_RELEASE);
 	{
 		unsigned actual_rate;
-		if (!ca_set_nominal_rate(audio_device, output.current_sample_rate, &actual_rate)) goto failed;
+		if (!ca_set_nominal_rate(audio_device, output.current_sample_rate, &actual_rate)) { rate_refused = true; goto failed; }
 		__atomic_store_n(&device_rate, actual_rate, __ATOMIC_RELEASE);
 	}
 	ca_configure_buffer(audio_device);
@@ -847,7 +940,7 @@ retry:
 	return;
 failed:
 	ca_dispose();
-	if (found && ca_allow_fallback && !__atomic_load_n(&ca_fallback_active, __ATOMIC_ACQUIRE) && (ca_exclusive || ca_bitperfect)) {
+	if (found && !rate_refused && ca_allow_fallback && !__atomic_load_n(&ca_fallback_active, __ATOMIC_ACQUIRE) && (ca_exclusive || ca_bitperfect)) {
 		/* the device exists but cannot be hogged or does not offer an integer bit-perfect stream:
 		 * playing through the shared mixer beats silence plus a restart loop. 'strict' disables this. */
 		LOG_WARN("exclusive/bit-perfect output is not available on this device - falling back to shared Float32 output (add 'strict' to the -a parameters to disable this fallback)");

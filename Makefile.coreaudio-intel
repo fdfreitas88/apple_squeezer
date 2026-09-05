@@ -1,6 +1,9 @@
 # Native CoreAudio technical candidate for Intel macOS 11 and newer.
 # Dependencies are loaded dynamically unless optional LINKALL is supplied.
 
+# Public release name; the binary reports it as 2.0.0-1595-apple-squeezer-intel-$(RELEASE).
+RELEASE = v1.0-rc4
+
 FLAC_BUILD = third_party/flac/build-intel
 FLAC_LIBRARY = $(FLAC_BUILD)/src/libFLAC/libFLAC.a
 OGG_BUILD = third_party/ogg/build-intel
@@ -10,7 +13,7 @@ SOXR_BUILD = third_party/soxr/build-intel
 SOXR_LIBRARY = $(SOXR_BUILD)/src/libsoxr.a
 
 OPTS = -DCOREAUDIO -DDSD -DALAC -DRESAMPLE -DDSP -DLINKALL -DNO_FAAD -DNO_MAD -DNO_MPG123 -DNO_VORBIS \
-	-DMODEL_NAME=AppleSqueezerIntel -DCUSTOM_VERSION=-apple-squeezer-intel-v1.0-rc3
+	-DMODEL_NAME=AppleSqueezerIntel -DCUSTOM_VERSION=-apple-squeezer-intel-$(RELEASE)
 
 CFLAGS = -arch x86_64 -mmacosx-version-min=11.0 -Wall -Wextra -fPIC -O2 \
 	-Ithird_party/flac/include -Ithird_party/alac/codec -Ithird_party/soxr/src
@@ -61,7 +64,23 @@ $(FLAC_LIBRARY): $(OGG_LIBRARY)
 		-DWITH_OGG=ON -DENABLE_MULTITHREADING=OFF -DBUILD_SHARED_LIBS=OFF
 	cmake --build $(FLAC_BUILD) --target FLAC -j4
 
-.PHONY: test-dsp test-buffer test-pcm
+.PHONY: test-dsp test-buffer test-pcm sign release
+# Ad-hoc signature: no developer identity, but a stable code identity and a Gatekeeper-clean
+# binary for the LMS plugin download path. Signing changes the file hash, so publish only
+# signed binaries and the hashes computed after signing.
+sign: $(EXECUTABLE) $(DSPCTL)
+	codesign --force --sign - --identifier com.applesqueezer.intel.player $(EXECUTABLE)
+	codesign --force --sign - --identifier com.applesqueezer.intel.dspctl $(DSPCTL)
+	codesign --verify --strict $(EXECUTABLE) $(DSPCTL)
+
+release: sign test-dsp test-buffer test-pcm
+	strings $(EXECUTABLE) | grep -q 'apple-squeezer-intel-$(RELEASE),' || (echo 'stale objects: run make clean'; exit 1)
+	mkdir -p dist
+	rm -f dist/apple-squeezer-intel-$(RELEASE).tar.gz dist/SHA256SUMS.txt
+	tar -czf dist/apple-squeezer-intel-$(RELEASE).tar.gz $(EXECUTABLE) $(DSPCTL) LICENSE.txt THIRD_PARTY_NOTICES.md doc/release-$(RELEASE).md
+	shasum -a 256 $(EXECUTABLE) $(DSPCTL) dist/apple-squeezer-intel-$(RELEASE).tar.gz > dist/SHA256SUMS.txt
+	cat dist/SHA256SUMS.txt
+
 test-dsp:
 	$(CC) -std=gnu99 -Wall -Wextra -O2 -DDSP -I. tools/test-dsp.c dsp.c dsp_config.c dsp_ir.c -lm -lpthread -o /tmp/apple-squeezer-test-dsp
 	/tmp/apple-squeezer-test-dsp
