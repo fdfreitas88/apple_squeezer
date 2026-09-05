@@ -358,14 +358,30 @@ static bool ca_verify_hardware_controls(AudioDeviceID device, bool enforce_unity
 	UInt32 size; Float32 scalar = 1.0f; UInt32 muted = 0; Boolean settable = false; bool has_volume, has_mute, ok = true;
 	has_volume = AudioObjectHasProperty(device, &volume);
 	has_mute = AudioObjectHasProperty(device, &mute);
+	/* Write the hardware controls only when they are not already at unity: the Chord Mojo
+	 * silences a DoP stream when it receives a USB volume/mute control write, so every write
+	 * has to be both necessary and issued before the output unit starts streaming. */
 	if (enforce_unity && has_volume && AudioObjectIsPropertySettable(device, &volume, &settable) == noErr && settable) {
-		ca_saved.changed_volume = AudioObjectSetPropertyData(device, &volume, 0, NULL, sizeof(scalar), &scalar) == noErr &&
-			ca_saved.have_volume && fabsf(ca_saved.volume - scalar) > .0001f;
+		Float32 current = 0.0f;
+		size = sizeof(current);
+		bool at_unity = AudioObjectGetPropertyData(device, &volume, 0, NULL, &size, &current) == noErr && current > .9999f;
+		if (!at_unity) {
+			LOG_INFO("CoreAudio hardware volume %.3f -> 1.000 for bit-perfect output", current);
+			ca_saved.changed_volume = AudioObjectSetPropertyData(device, &volume, 0, NULL, sizeof(scalar), &scalar) == noErr &&
+				ca_saved.have_volume && fabsf(ca_saved.volume - scalar) > .0001f;
+		}
 	}
 	settable = false;
-	if (enforce_unity && has_mute && AudioObjectIsPropertySettable(device, &mute, &settable) == noErr && settable)
-		ca_saved.changed_mute = AudioObjectSetPropertyData(device, &mute, 0, NULL, sizeof(muted), &muted) == noErr &&
-			ca_saved.have_mute && ca_saved.mute != muted;
+	if (enforce_unity && has_mute && AudioObjectIsPropertySettable(device, &mute, &settable) == noErr && settable) {
+		UInt32 current = 0;
+		size = sizeof(current);
+		bool is_muted = AudioObjectGetPropertyData(device, &mute, 0, NULL, &size, &current) == noErr && current;
+		if (is_muted) {
+			LOG_INFO("CoreAudio hardware mute released for bit-perfect output");
+			ca_saved.changed_mute = AudioObjectSetPropertyData(device, &mute, 0, NULL, sizeof(muted), &muted) == noErr &&
+				ca_saved.have_mute && ca_saved.mute != muted;
+		}
+	}
 	if (has_volume) { size=sizeof(scalar); ok=AudioObjectGetPropertyData(device,&volume,0,NULL,&size,&scalar)==noErr&&scalar>.9999f; }
 	if (has_mute) { size=sizeof(muted); ok=ok&&AudioObjectGetPropertyData(device,&mute,0,NULL,&size,&muted)==noErr&&!muted; }
 	LOG_INFO("CoreAudio hardware controls: volume=%s mute=%s unity=%s",
@@ -806,12 +822,14 @@ retry:
 	if (AudioUnitSetProperty(audio_unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &callback, sizeof(callback)) != noErr) goto failed;
 	status = AudioUnitInitialize(audio_unit);
 	if (status != noErr) goto failed;
+	/* hardware controls are settled before the first frame leaves: a control write during a
+	 * running DoP stream mutes the Chord Mojo until the next stream start */
+	__atomic_store_n(&ca_volume_verified, ca_verify_hardware_controls(audio_device, ca_bitperfect), __ATOMIC_RELEASE);
+	if (ca_bitperfect && !__atomic_load_n(&ca_volume_verified, __ATOMIC_ACQUIRE)) { LOG_ERROR("bit-perfect mode cannot verify unity hardware volume"); goto failed; }
 	status = AudioOutputUnitStart(audio_unit);
 	if (status != noErr) goto failed;
 	__atomic_store_n(&ca_physical_verified, ca_physical_format(audio_device, output.current_sample_rate, ca_bitperfect), __ATOMIC_RELEASE);
 	if (!__atomic_load_n(&ca_physical_verified, __ATOMIC_ACQUIRE)) goto failed;
-	__atomic_store_n(&ca_volume_verified, ca_verify_hardware_controls(audio_device, ca_bitperfect), __ATOMIC_RELEASE);
-	if (ca_bitperfect && !__atomic_load_n(&ca_volume_verified, __ATOMIC_ACQUIRE)) { LOG_ERROR("bit-perfect mode cannot verify unity hardware volume"); goto failed; }
 	ca_measure_latency();
 	ca_add_listeners();
 	__atomic_store_n(&output.error_opening, false, __ATOMIC_RELEASE);
