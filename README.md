@@ -1,3 +1,5 @@
+<p align="center"><img src="doc/logo.png" alt="Apple Squeezer" width="200"></p>
+
 # Apple Squeezer Intel v1.0-rc4
 
 Apple Squeezer is an Intel macOS build of Squeezelite using Apple's native
